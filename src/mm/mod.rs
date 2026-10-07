@@ -16,7 +16,7 @@ pub struct MemoryManager {
     pub buddy: BuddyAllocator,
     pub slab: SlabAllocator,
     pub kernel_space: AddressSpace,
-    pub ram: Vec<u8>, // 模拟物理内存存储
+    ram: Vec<u8>, // 通过受检查的物理内存接口访问，禁止替换缓冲区
 }
 
 impl MemoryManager {
@@ -30,9 +30,52 @@ impl MemoryManager {
         }
     }
 
+    /// 分配并清零完整页块。Buddy 只管理页号，不持有 RAM 指针。
+    pub fn allocate_pages_zeroed(&mut self, order: usize) -> Result<usize, &'static str> {
+        let pfn = self
+            .buddy
+            .allocate_pages(order)
+            .ok_or("Out of physical memory")?;
+        let range = pfn.checked_mul(PAGE_SIZE).and_then(|start| {
+            PAGE_SIZE
+                .checked_shl(order as u32)
+                .and_then(|bytes| start.checked_add(bytes))
+                .map(|end| start..end)
+        });
+        if let Some(bytes) = range.and_then(|range| self.ram.get_mut(range)) {
+            bytes.fill(0);
+            Ok(pfn)
+        } else {
+            self.buddy.free_pages(pfn)?;
+            Err("Physical memory access out of bounds")
+        }
+    }
+
+    pub(crate) fn copy_page(&mut self, source: usize, target: usize) -> Result<(), &'static str> {
+        let source_start = source
+            .checked_mul(PAGE_SIZE)
+            .ok_or("Physical address overflow")?;
+        let source_end = source_start
+            .checked_add(PAGE_SIZE)
+            .ok_or("Physical address overflow")?;
+        let target_start = target
+            .checked_mul(PAGE_SIZE)
+            .ok_or("Physical address overflow")?;
+        let target_end = target_start
+            .checked_add(PAGE_SIZE)
+            .ok_or("Physical address overflow")?;
+        if source_end > self.ram.len() || target_end > self.ram.len() {
+            return Err("Physical memory access out of bounds");
+        }
+        self.ram.copy_within(source_start..source_end, target_start);
+        Ok(())
+    }
+
     /// 物理内存写入
     pub fn write_physical(&mut self, paddr: usize, data: &[u8]) -> Result<(), &'static str> {
-        let end_paddr = paddr.checked_add(data.len()).ok_or("Physical address overflow")?;
+        let end_paddr = paddr
+            .checked_add(data.len())
+            .ok_or("Physical address overflow")?;
         if end_paddr > self.ram.len() {
             return Err("Physical memory access out of bounds");
         }
@@ -42,7 +85,9 @@ impl MemoryManager {
 
     /// 物理内存读取
     pub fn read_physical(&self, paddr: usize, buf: &mut [u8]) -> Result<(), &'static str> {
-        let end_paddr = paddr.checked_add(buf.len()).ok_or("Physical address overflow")?;
+        let end_paddr = paddr
+            .checked_add(buf.len())
+            .ok_or("Physical address overflow")?;
         if end_paddr > self.ram.len() {
             return Err("Physical memory access out of bounds");
         }
@@ -61,7 +106,9 @@ impl MemoryManager {
         data: &[u8],
         is_user: bool,
     ) -> Result<usize, &'static str> {
-        let _ = vaddr.checked_add(data.len()).ok_or("Virtual address overflow")?;
+        let _ = vaddr
+            .checked_add(data.len())
+            .ok_or("Virtual address overflow")?;
         let mut bytes_written = 0;
 
         while bytes_written < data.len() {
@@ -85,7 +132,8 @@ impl MemoryManager {
         vaddr: usize,
         data: &[u8],
     ) -> Result<(), &'static str> {
-        self.write_virtual_checked(space, vaddr, data, false).map(|_| ())
+        self.write_virtual_checked(space, vaddr, data, false)
+            .map(|_| ())
     }
 
     /// 跨页安全的虚拟内存读取：逐页检查与读取
@@ -96,7 +144,9 @@ impl MemoryManager {
         buf: &mut [u8],
         is_user: bool,
     ) -> Result<usize, &'static str> {
-        let _ = vaddr.checked_add(buf.len()).ok_or("Virtual address overflow")?;
+        let _ = vaddr
+            .checked_add(buf.len())
+            .ok_or("Virtual address overflow")?;
         let mut bytes_read = 0;
 
         while bytes_read < buf.len() {
@@ -120,6 +170,7 @@ impl MemoryManager {
         vaddr: usize,
         buf: &mut [u8],
     ) -> Result<(), &'static str> {
-        self.read_virtual_checked(space, vaddr, buf, false).map(|_| ())
+        self.read_virtual_checked(space, vaddr, buf, false)
+            .map(|_| ())
     }
 }

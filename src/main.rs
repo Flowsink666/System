@@ -1,17 +1,9 @@
 //! Mini-OS Kernel: 具备高性能内存分配、CFS 进程调度与虚拟文件系统的微型操作系统内核
 
-pub mod arch;
-pub mod benchmark;
-pub mod fs;
-pub mod kernel;
-pub mod mm;
-pub mod sched;
-pub mod shell;
-pub mod syscall;
-
-use benchmark::run_all_benchmarks;
-use kernel::Kernel;
-use shell::KernelShell;
+use mini_os_kernel::benchmark::run_all_benchmarks;
+use mini_os_kernel::fs;
+use mini_os_kernel::kernel::Kernel;
+use mini_os_kernel::shell::KernelShell;
 use std::env;
 
 fn run_kernel_demo() {
@@ -24,7 +16,7 @@ fn run_kernel_demo() {
     let mut kernel = Kernel::new(16384, 4096, 128);
     println!("  - CPU: VirtualCpu (Ring0/Ring3, 上下文切换支持)");
     println!("  - 内存: 16384 页 (64MB), 伙伴系统 Buddy Allocator (Order 0..10) + SLAB 缓存池");
-    println!("  - 调度: 完全公平调度器 CFS (红黑平衡树, 40 级 Nice 权重, 纳秒级 vruntime)");
+    println!("  - 调度: 完全公平调度器 CFS (B-Tree 就绪树, 40 级 Nice 权重, 纳秒级 vruntime)");
     println!("  - 文件: VFS + Inode/Direct Blocks + LRU 读写缓冲缓存 (Buffer Cache)");
 
     // 2. 内存分配验证

@@ -66,8 +66,10 @@ impl<'a> KernelShell<'a> {
             let _ = stdout.flush();
 
             let mut input = String::new();
-            if stdin.lock().read_line(&mut input).is_err() {
-                break;
+            match stdin.lock().read_line(&mut input) {
+                Ok(0) => break, // EOF
+                Ok(_) => {}
+                Err(_) => break,
             }
 
             let trimmed = input.trim();
@@ -201,7 +203,7 @@ impl<'a> KernelShell<'a> {
             }
         };
 
-        match self.kernel.pm.kill(pid) {
+        match self.kernel.terminate_process(pid, 0) {
             Ok(_) => println!("已成功终止进程 PID {}", pid),
             Err(e) => println!("终止进程失败: {}", e),
         }
@@ -301,16 +303,23 @@ impl<'a> KernelShell<'a> {
         let path = self.normalize_path(args[0]);
         match self.kernel.vfs.open(&path, O_RDONLY) {
             Ok(fd) => {
-                let mut content = vec![0u8; 4096];
-                match self.kernel.vfs.read(fd, &mut content) {
-                    Ok(n) => {
-                        let text = String::from_utf8_lossy(&content[..n]);
-                        print!("{}", text);
-                        if !text.ends_with('\n') {
-                            println!();
+                let mut buf = [0u8; 1024];
+                let mut read_any = false;
+                loop {
+                    match self.kernel.vfs.read(fd, &mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            print!("{}", String::from_utf8_lossy(&buf[..n]));
+                            read_any = true;
+                        }
+                        Err(e) => {
+                            println!("读取错误: {}", e);
+                            break;
                         }
                     }
-                    Err(e) => println!("读取错误: {}", e),
+                }
+                if read_any {
+                    println!();
                 }
                 let _ = self.kernel.vfs.close(fd);
             }

@@ -1,54 +1,40 @@
 //! 系统调用分发与特权级边界检查 (Syscall Dispatch & Privilege Boundary)
-//! 
+//!
 //! 高可靠特性：
 //! 1. 用户指针与缓冲区经由受检查的地址空间转换 (read_virtual_checked / write_virtual_checked)
 //! 2. 基于进程专属描述符表 (PCB fd_table) 解析文件句柄，严防句柄越权
 //! 3. 接入 waitpid、sleep、fork 及 IPC 管道完整流程
 
 use super::types::*;
-use crate::fs::VirtualFileSystem;
-use crate::mm::MemoryManager;
-use crate::sched::{BlockedReason, FileDescriptorEntry, ProcessManager};
+use crate::kernel::Kernel;
+use crate::sched::FileDescriptorEntry;
 
 pub struct SyscallDispatcher;
 
 impl SyscallDispatcher {
     /// 执行系统调用处理
-    pub fn dispatch(
-        args: SyscallArgs,
-        mm: &mut MemoryManager,
-        pm: &mut ProcessManager,
-        vfs: &mut VirtualFileSystem,
-    ) -> Result<isize, &'static str> {
-        let curr_pid = pm.current_pid.ok_or("No current process context")?;
+    pub(crate) fn dispatch(args: SyscallArgs, kernel: &mut Kernel) -> Result<isize, &'static str> {
+        let curr_pid = kernel.pm.current_pid.ok_or("No current process context")?;
+        match args.num {
+            SYS_EXIT => {
+                kernel.terminate_process(curr_pid, args.arg0 as i32)?;
+                return Ok(0);
+            }
+            SYS_FORK => return kernel.fork_process(curr_pid).map(|pid| pid as isize),
+            SYS_YIELD => {
+                kernel.yield_current()?;
+                return Ok(0);
+            }
+            SYS_SLEEP => {
+                kernel.sleep_current(args.arg0 as u64)?;
+                return Ok(0);
+            }
+            _ => {}
+        }
 
+        let Kernel { mm, pm, vfs, .. } = kernel;
         match args.num {
             SYS_GETPID => Ok(curr_pid as isize),
-
-            SYS_EXIT => {
-                let exit_code = args.arg0 as i32;
-                if let Some(proc) = pm.processes.get_mut(&curr_pid) {
-                    proc.address_space.destroy(&mut mm.buddy);
-                    for fd_entry in proc.fd_table.values() {
-                        let _ = vfs.close(fd_entry.vfs_fd);
-                    }
-                    proc.exit_code = exit_code;
-                }
-                pm.kill(curr_pid)?;
-                Ok(0)
-            }
-
-            SYS_FORK => {
-                let child_pid = pm.fork_pcb(curr_pid)?;
-                let cloned_space = {
-                    let parent = pm.processes.get(&curr_pid).unwrap();
-                    parent.address_space.fork_clone(&mut mm.buddy, &mut mm.ram)?
-                };
-                if let Some(child) = pm.processes.get_mut(&child_pid) {
-                    child.address_space = cloned_space;
-                }
-                Ok(child_pid as isize)
-            }
 
             SYS_WAITPID => {
                 let child_pid = args.arg0;
@@ -80,7 +66,10 @@ impl SyscallDispatcher {
                 let flags = args.arg2 as u32;
 
                 let path_str = if path_va != 0 && path_len > 0 {
-                    let mut path_buf = vec![0u8; path_len.min(256)];
+                    if path_len > 256 {
+                        return Err("Path too long (exceeds 256 bytes)");
+                    }
+                    let mut path_buf = vec![0u8; path_len];
                     let proc = pm.processes.get_mut(&curr_pid).unwrap();
                     mm.read_virtual_checked(&mut proc.address_space, path_va, &mut path_buf, true)?;
                     String::from_utf8(path_buf).map_err(|_| "Invalid UTF-8 in path")?
@@ -102,18 +91,39 @@ impl SyscallDispatcher {
                 let buf_va = args.arg1;
                 let len = args.arg2;
 
+                if len == 0 {
+                    return Ok(0);
+                }
+
+                if buf_va == 0 {
+                    return Err("Bad buffer address: NULL pointer");
+                }
+
+                let safe_len = len.min(70 * 1024);
+
                 let vfs_fd = {
                     let proc = pm.processes.get(&curr_pid).unwrap();
                     let fd_entry = proc.fd_table.get(&user_fd).ok_or("Bad file descriptor")?;
                     fd_entry.vfs_fd
                 };
 
-                let mut kbuf = vec![0u8; len];
+                let old_offset = vfs
+                    .open_files
+                    .get(&vfs_fd)
+                    .ok_or("Invalid file descriptor")?
+                    .offset;
+
+                let mut kbuf = vec![0u8; safe_len];
                 let n = vfs.read(vfs_fd, &mut kbuf)?;
 
-                if buf_va != 0 && n > 0 {
+                if n > 0 {
                     let proc = pm.processes.get_mut(&curr_pid).unwrap();
-                    mm.write_virtual_checked(&mut proc.address_space, buf_va, &kbuf[..n], true)?;
+                    if let Err(e) =
+                        mm.write_virtual_checked(&mut proc.address_space, buf_va, &kbuf[..n], true)
+                    {
+                        let _ = vfs.seek(vfs_fd, old_offset);
+                        return Err(e);
+                    }
                 }
 
                 Ok(n as isize)
@@ -125,22 +135,27 @@ impl SyscallDispatcher {
                 let buf_va = args.arg1;
                 let len = args.arg2;
 
+                if len == 0 {
+                    return Ok(0);
+                }
+
+                if buf_va == 0 {
+                    return Err("Bad buffer address: NULL pointer");
+                }
+
+                let safe_len = len.min(70 * 1024);
+
                 let vfs_fd = {
                     let proc = pm.processes.get(&curr_pid).unwrap();
                     let fd_entry = proc.fd_table.get(&user_fd).ok_or("Bad file descriptor")?;
                     fd_entry.vfs_fd
                 };
 
-                let kbuf = if buf_va != 0 && len > 0 {
-                    let mut tmp = vec![0u8; len];
-                    let proc = pm.processes.get_mut(&curr_pid).unwrap();
-                    mm.read_virtual_checked(&mut proc.address_space, buf_va, &mut tmp, true)?;
-                    tmp
-                } else {
-                    b"default write payload".to_vec()
-                };
+                let mut tmp = vec![0u8; safe_len];
+                let proc = pm.processes.get_mut(&curr_pid).unwrap();
+                mm.read_virtual_checked(&mut proc.address_space, buf_va, &mut tmp, true)?;
 
-                let n = vfs.write(vfs_fd, &kbuf)?;
+                let n = vfs.write(vfs_fd, &tmp)?;
                 Ok(n as isize)
             }
 
@@ -152,21 +167,44 @@ impl SyscallDispatcher {
                 Ok(0)
             }
 
-            SYS_YIELD => {
-                pm.schedule_step(1);
-                Ok(0)
-            }
-
-            SYS_SLEEP => {
-                // arg0: sleep ticks
-                pm.block(curr_pid, BlockedReason::Sleeping);
-                Ok(0)
-            }
-
             SYS_PIPE => {
                 let capacity = if args.arg0 > 0 { args.arg0 } else { 4096 };
                 let pipe_id = pm.create_pipe(capacity);
                 Ok(pipe_id as isize)
+            }
+
+            SYS_MKDIR => {
+                let path_va = args.arg0;
+                let path_len = args.arg1;
+                if path_va == 0 || path_len == 0 {
+                    return Err("Invalid path argument for mkdir");
+                }
+                if path_len > 256 {
+                    return Err("Path too long (exceeds 256 bytes)");
+                }
+                let mut path_buf = vec![0u8; path_len];
+                let proc = pm.processes.get_mut(&curr_pid).unwrap();
+                mm.read_virtual_checked(&mut proc.address_space, path_va, &mut path_buf, true)?;
+                let path_str = String::from_utf8(path_buf).map_err(|_| "Invalid UTF-8 in path")?;
+                let inode_id = vfs.mkdir(&path_str)?;
+                Ok(inode_id as isize)
+            }
+
+            SYS_STAT => {
+                let path_va = args.arg0;
+                let path_len = args.arg1;
+                if path_va == 0 || path_len == 0 {
+                    return Err("Invalid path argument for stat");
+                }
+                if path_len > 256 {
+                    return Err("Path too long (exceeds 256 bytes)");
+                }
+                let mut path_buf = vec![0u8; path_len];
+                let proc = pm.processes.get_mut(&curr_pid).unwrap();
+                mm.read_virtual_checked(&mut proc.address_space, path_va, &mut path_buf, true)?;
+                let path_str = String::from_utf8(path_buf).map_err(|_| "Invalid UTF-8 in path")?;
+                let stat = vfs.stat(&path_str)?;
+                Ok(stat.size as isize)
             }
 
             _ => Err("Invalid or unimplemented syscall number"),

@@ -13,9 +13,19 @@ use std::collections::HashMap;
 /// 结构化调度事件（零堆分配开销，供热路径高效处理）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduleEvent {
-    ContextSwitch { old_pid: Option<usize>, new_pid: usize },
-    Running { pid: usize, exec_ticks: u64, remaining_burst: u64, vruntime: u64 },
-    Terminated { pid: usize },
+    ContextSwitch {
+        old_pid: Option<usize>,
+        new_pid: usize,
+    },
+    Running {
+        pid: usize,
+        exec_ticks: u64,
+        remaining_burst: u64,
+        vruntime: u64,
+    },
+    Terminated {
+        pid: usize,
+    },
     Idle,
 }
 
@@ -23,11 +33,22 @@ impl ScheduleEvent {
     pub fn display(&self, processes: &HashMap<usize, ProcessControlBlock>) -> String {
         match *self {
             ScheduleEvent::ContextSwitch { old_pid, new_pid } => {
-                let name = processes.get(&new_pid).map(|p| p.name.as_str()).unwrap_or("unknown");
+                let name = processes
+                    .get(&new_pid)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("unknown");
                 format!("[Switch] {:?} -> PID {} ({})", old_pid, new_pid, name)
             }
-            ScheduleEvent::Running { pid, exec_ticks, remaining_burst, vruntime } => {
-                let name = processes.get(&pid).map(|p| p.name.as_str()).unwrap_or("unknown");
+            ScheduleEvent::Running {
+                pid,
+                exec_ticks,
+                remaining_burst,
+                vruntime,
+            } => {
+                let name = processes
+                    .get(&pid)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("unknown");
                 format!(
                     "PID {}: [{}] executed {} ticks, remaining burst={}, vruntime={}",
                     pid, name, exec_ticks, remaining_burst, vruntime
@@ -84,7 +105,10 @@ impl ProcessManager {
 
     /// 复制父进程基础 PCB (Fork)
     pub fn fork_pcb(&mut self, parent_pid: usize) -> Result<usize, &'static str> {
-        let parent = self.processes.get(&parent_pid).ok_or("Parent PID not found")?;
+        let parent = self
+            .processes
+            .get(&parent_pid)
+            .ok_or("Parent PID not found")?;
         let child_pid = self.next_pid;
         self.next_pid += 1;
 
@@ -97,6 +121,7 @@ impl ProcessManager {
         );
         child_pcb.vruntime = parent.vruntime;
         child_pcb.fd_table = parent.fd_table.clone();
+        child_pcb.next_fd = parent.next_fd;
         child_pcb.vma_list = parent.vma_list.clone();
         child_pcb.context = parent.context;
 
@@ -131,18 +156,17 @@ impl ProcessManager {
 
         if need_switch {
             // 将旧进程放回就绪队列（若仍可就绪）
-            if let Some(old_pid) = self.current_pid {
-                if let Some(old_proc) = self.processes.get_mut(&old_pid) {
-                    if old_proc.state == ProcessState::Running {
-                        if old_proc.cpu_burst_remaining == 0 {
-                            old_proc.state = ProcessState::Terminated;
-                        } else {
-                            old_proc.state = ProcessState::Ready;
-                            let vruntime = old_proc.vruntime;
-                            let weight = old_proc.weight;
-                            self.scheduler.enqueue_task(old_pid, vruntime, weight);
-                        }
-                    }
+            if let Some(old_pid) = self.current_pid
+                && let Some(old_proc) = self.processes.get_mut(&old_pid)
+                && old_proc.state == ProcessState::Running
+            {
+                if old_proc.cpu_burst_remaining == 0 {
+                    old_proc.state = ProcessState::Terminated;
+                } else {
+                    old_proc.state = ProcessState::Ready;
+                    let vruntime = old_proc.vruntime;
+                    let weight = old_proc.weight;
+                    self.scheduler.enqueue_task(old_pid, vruntime, weight);
                 }
             }
 
@@ -163,7 +187,9 @@ impl ProcessManager {
         // 2. 执行当前进程
         if let Some(pid) = self.current_pid {
             let proc = self.processes.get_mut(&pid).unwrap();
-            let exec_ticks = ticks.min(proc.cpu_burst_remaining).min(proc.time_slice_remaining);
+            let exec_ticks = ticks
+                .min(proc.cpu_burst_remaining)
+                .min(proc.time_slice_remaining);
             proc.cpu_burst_remaining = proc.cpu_burst_remaining.saturating_sub(exec_ticks);
             proc.time_slice_remaining = proc.time_slice_remaining.saturating_sub(exec_ticks);
             proc.update_vruntime(exec_ticks * self.tick_ns);
@@ -171,15 +197,18 @@ impl ProcessManager {
             let remaining_burst = proc.cpu_burst_remaining;
             let vruntime = proc.vruntime;
 
-            let event = if context_switched {
+            if remaining_burst == 0 {
+                proc.state = ProcessState::Terminated;
+                self.current_pid = None;
+            }
+
+            let event = if remaining_burst == 0 {
+                ScheduleEvent::Terminated { pid }
+            } else if context_switched {
                 ScheduleEvent::ContextSwitch {
                     old_pid: old_pid_record,
                     new_pid: pid,
                 }
-            } else if remaining_burst == 0 {
-                proc.state = ProcessState::Terminated;
-                self.current_pid = None;
-                ScheduleEvent::Terminated { pid }
             } else {
                 ScheduleEvent::Running {
                     pid,
@@ -222,23 +251,32 @@ impl ProcessManager {
         }
     }
 
-    /// 唤醒进程
-    pub fn wake(&mut self, pid: usize) {
-        if let Some(proc) = self.processes.get_mut(&pid) {
-            if matches!(proc.state, ProcessState::Blocked(_)) {
-                proc.state = ProcessState::Ready;
-                // 防止长时间睡眠后唤醒产生过度抢占，将 vruntime 对齐当前 min_vruntime
-                proc.vruntime = proc.vruntime.max(self.scheduler.min_vruntime);
-                let vruntime = proc.vruntime;
-                let weight = proc.weight;
-                self.scheduler.enqueue_task(pid, vruntime, weight);
-            }
+    /// 仅解除匹配的等待，避免无关事件提前唤醒进程。
+    pub fn wake(&mut self, pid: usize, reason: BlockedReason) -> bool {
+        if let Some(proc) = self.processes.get_mut(&pid)
+            && proc.state == ProcessState::Blocked(reason)
+        {
+            proc.state = ProcessState::Ready;
+            // 防止长时间睡眠后唤醒产生过度抢占，将 vruntime 对齐当前 min_vruntime
+            proc.vruntime = proc.vruntime.max(self.scheduler.min_vruntime);
+            let vruntime = proc.vruntime;
+            let weight = proc.weight;
+            self.scheduler.enqueue_task(pid, vruntime, weight);
+            return true;
         }
+        false
     }
 
     /// 等待子进程退出 (Waitpid)
-    pub fn waitpid(&mut self, parent_pid: usize, target_child_pid: usize) -> Result<Option<i32>, &'static str> {
-        let child = self.processes.get(&target_child_pid).ok_or("Child process not found")?;
+    pub fn waitpid(
+        &mut self,
+        parent_pid: usize,
+        target_child_pid: usize,
+    ) -> Result<Option<i32>, &'static str> {
+        let child = self
+            .processes
+            .get(&target_child_pid)
+            .ok_or("Child process not found")?;
         if child.ppid != parent_pid {
             return Err("Process is not a child of caller");
         }
@@ -248,9 +286,64 @@ impl ProcessManager {
             self.processes.remove(&target_child_pid);
             Ok(Some(exit_code))
         } else {
-            self.block(parent_pid, BlockedReason::WaitingChild);
+            self.block(
+                parent_pid,
+                BlockedReason::WaitingChild {
+                    pid: target_child_pid,
+                },
+            );
             Ok(None)
         }
+    }
+
+    /// 主动让出 CPU：优先选择已就绪的其他任务，不推进时间或执行任务。
+    pub(crate) fn yield_current(&mut self) -> (Option<usize>, ScheduleEvent, bool) {
+        let old_pid = self.current_pid;
+        if let Some(pid) = old_pid {
+            self.scheduler.dequeue_task_by_pid(pid);
+        }
+        let Some(next_pid) = self.scheduler.pick_next_task() else {
+            if let Some(pid) = old_pid
+                && let Some(proc) = self.processes.get_mut(&pid)
+            {
+                proc.state = ProcessState::Running;
+                return (
+                    old_pid,
+                    ScheduleEvent::Running {
+                        pid,
+                        exec_ticks: 0,
+                        remaining_burst: proc.cpu_burst_remaining,
+                        vruntime: proc.vruntime,
+                    },
+                    false,
+                );
+            }
+            return (old_pid, ScheduleEvent::Idle, false);
+        };
+
+        if let Some(pid) = old_pid
+            && let Some(proc) = self.processes.get_mut(&pid)
+            && matches!(proc.state, ProcessState::Running | ProcessState::Ready)
+        {
+            proc.state = ProcessState::Ready;
+            self.scheduler.enqueue_task(pid, proc.vruntime, proc.weight);
+        }
+
+        let proc = self
+            .processes
+            .get_mut(&next_pid)
+            .expect("Ready task must have a PCB");
+        proc.state = ProcessState::Running;
+        proc.time_slice_remaining = self.scheduler.calculate_timeslice(proc.weight);
+        self.current_pid = Some(next_pid);
+        (
+            Some(next_pid),
+            ScheduleEvent::ContextSwitch {
+                old_pid,
+                new_pid: next_pid,
+            },
+            old_pid != Some(next_pid),
+        )
     }
 
     /// 创建匿名管道

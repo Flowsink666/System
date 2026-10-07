@@ -1,11 +1,11 @@
 use mini_os_kernel::fs::{self, VirtualFileSystem};
 use mini_os_kernel::kernel::Kernel;
 use mini_os_kernel::mm::{
-    AddressSpace, BuddyAllocator, MemoryManager, SlabAllocator, FLAG_PRESENT, FLAG_WRITABLE,
-    PAGE_SIZE,
+    AddressSpace, BuddyAllocator, FLAG_PRESENT, FLAG_WRITABLE, MemoryManager, PAGE_SIZE,
+    SlabAllocator,
 };
 use mini_os_kernel::sched::{CfsScheduler, ProcessManager, ProcessState};
-use mini_os_kernel::syscall::{SyscallArgs, SYS_GETPID, SYS_KFREE, SYS_KMALLOC};
+use mini_os_kernel::syscall::{SYS_GETPID, SYS_KFREE, SYS_KMALLOC, SyscallArgs};
 
 #[test]
 fn test_buddy_allocator_basic_and_coalesce() {
@@ -51,11 +51,11 @@ fn test_slab_allocator_reuse() {
 
 #[test]
 fn test_page_table_and_tlb() {
-    let mut buddy = BuddyAllocator::new(1024);
+    let mut mm = MemoryManager::new(1024);
     let mut space = AddressSpace::new(16);
 
     let va = 0x0040_1000;
-    let pfn = space.allocate_and_map(&mut buddy, va, 0x3).expect("map page");
+    let pfn = space.allocate_and_map(&mut mm, va, 0x3).expect("map page");
 
     // 清空 TLB 以测试多级页表遍历 (Page Table Walk) 与 TLB 填充
     space.tlb.flush();
@@ -74,7 +74,7 @@ fn test_page_table_and_tlb() {
     assert_eq!(space.tlb.hits, 1);
 
     // 解除映射
-    space.unmap_and_free(&mut buddy, va).expect("unmap");
+    space.unmap_and_free(&mut mm.buddy, va).expect("unmap");
     assert!(space.translate(va).is_err());
 }
 
@@ -99,7 +99,11 @@ fn test_process_manager_multitasking() {
     let p2 = pm.spawn("task2", 0, 10);
 
     let mut step_count = 0;
-    while pm.processes.values().any(|p| p.state != ProcessState::Terminated) {
+    while pm
+        .processes
+        .values()
+        .any(|p| p.state != ProcessState::Terminated)
+    {
         let _ = pm.schedule_step(2);
         step_count += 1;
         if step_count > 100 {
@@ -107,8 +111,14 @@ fn test_process_manager_multitasking() {
         }
     }
 
-    assert_eq!(pm.processes.get(&p1).unwrap().state, ProcessState::Terminated);
-    assert_eq!(pm.processes.get(&p2).unwrap().state, ProcessState::Terminated);
+    assert_eq!(
+        pm.processes.get(&p1).unwrap().state,
+        ProcessState::Terminated
+    );
+    assert_eq!(
+        pm.processes.get(&p2).unwrap().state,
+        ProcessState::Terminated
+    );
 }
 
 #[test]
@@ -120,14 +130,18 @@ fn test_filesystem_hierarchy_and_cache() {
     vfs.mkdir("/var/log").expect("mkdir /var/log");
 
     // 创建文件并写入
-    let fd = vfs.open("/var/log/syslog.log", fs::O_CREAT | fs::O_RDWR).expect("create file");
+    let fd = vfs
+        .open("/var/log/syslog.log", fs::O_CREAT | fs::O_RDWR)
+        .expect("create file");
     let test_data = b"Kernel boot: initial check passed OK.\n";
     let written = vfs.write(fd, test_data).expect("write file");
     assert_eq!(written, test_data.len());
     vfs.close(fd).expect("close fd");
 
     // 重新打开并读取
-    let fd_read = vfs.open("/var/log/syslog.log", fs::O_RDONLY).expect("open file");
+    let fd_read = vfs
+        .open("/var/log/syslog.log", fs::O_RDONLY)
+        .expect("open file");
     let mut read_buf = vec![0u8; 128];
     let read_bytes = vfs.read(fd_read, &mut read_buf).expect("read file");
     assert_eq!(&read_buf[..read_bytes], test_data);
@@ -142,16 +156,34 @@ fn test_syscall_dispatch() {
     let mut kernel = Kernel::new(1024, 512, 16);
 
     // 测试 SYS_GETPID
-    let args_pid = SyscallArgs { num: SYS_GETPID, arg0: 0, arg1: 0, arg2: 0, arg3: 0 };
+    let args_pid = SyscallArgs {
+        num: SYS_GETPID,
+        arg0: 0,
+        arg1: 0,
+        arg2: 0,
+        arg3: 0,
+    };
     let res_pid = kernel.syscall(args_pid).expect("syscall getpid");
     assert!(res_pid >= 0);
 
     // 测试 SYS_KMALLOC & SYS_KFREE
-    let args_alloc = SyscallArgs { num: SYS_KMALLOC, arg0: 128, arg1: 0, arg2: 0, arg3: 0 };
+    let args_alloc = SyscallArgs {
+        num: SYS_KMALLOC,
+        arg0: 128,
+        arg1: 0,
+        arg2: 0,
+        arg3: 0,
+    };
     let alloc_handle = kernel.syscall(args_alloc).expect("syscall kmalloc");
     assert!(alloc_handle > 0);
 
-    let args_free = SyscallArgs { num: SYS_KFREE, arg0: alloc_handle as usize, arg1: 0, arg2: 0, arg3: 0 };
+    let args_free = SyscallArgs {
+        num: SYS_KFREE,
+        arg0: alloc_handle as usize,
+        arg1: 0,
+        arg2: 0,
+        arg3: 0,
+    };
     let res_free = kernel.syscall(args_free).expect("syscall kfree");
     assert_eq!(res_free, 0);
 }
@@ -165,7 +197,9 @@ fn test_indirect_blocks_and_disk_reclamation() {
     let large_size = 20 * 512;
     let data: Vec<u8> = (0..large_size).map(|i| (i % 251) as u8).collect();
 
-    let fd = vfs.open("/large_file.bin", fs::O_CREAT | fs::O_RDWR).expect("create large file");
+    let fd = vfs
+        .open("/large_file.bin", fs::O_CREAT | fs::O_RDWR)
+        .expect("create large file");
     let written = vfs.write(fd, &data).expect("write large file");
     assert_eq!(written, large_size);
     vfs.close(fd).expect("close fd");
@@ -174,7 +208,9 @@ fn test_indirect_blocks_and_disk_reclamation() {
     assert_eq!(vfs.free_blocks.len(), initial_free - 21);
 
     // 读取并验证完整性
-    let fd_read = vfs.open("/large_file.bin", fs::O_RDONLY).expect("open large file");
+    let fd_read = vfs
+        .open("/large_file.bin", fs::O_RDONLY)
+        .expect("open large file");
     let mut read_buf = vec![0u8; large_size];
     let n = vfs.read(fd_read, &mut read_buf).expect("read large file");
     assert_eq!(n, large_size);
@@ -212,26 +248,42 @@ fn test_cross_page_virtual_memory_access_and_permissions() {
     let mut space = AddressSpace::new(16);
 
     // 映射两个相邻虚拟页 (0x1000 与 0x2000)，但分配两个不同的物理页
-    let pfn1 = space.allocate_and_map(&mut mm.buddy, 0x1000, FLAG_PRESENT | FLAG_WRITABLE).unwrap();
-    let pfn2 = space.allocate_and_map(&mut mm.buddy, 0x2000, FLAG_PRESENT | FLAG_WRITABLE).unwrap();
+    let pfn1 = space
+        .allocate_and_map(&mut mm, 0x1000, FLAG_PRESENT | FLAG_WRITABLE)
+        .unwrap();
+    let pfn2 = space
+        .allocate_and_map(&mut mm, 0x2000, FLAG_PRESENT | FLAG_WRITABLE)
+        .unwrap();
 
     // 跨页写入：从 0x1FFE 开始写 6 个字节 (最后两字节落在 0x1000 页，后 4 字节落在 0x2000 页)
     let payload = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-    let written = mm.write_virtual_checked(&mut space, 0x1FFE, &payload, false).unwrap();
+    let written = mm
+        .write_virtual_checked(&mut space, 0x1FFE, &payload, false)
+        .unwrap();
     assert_eq!(written, 6);
 
     // 验证物理 RAM 中对应位置确实被精准写入
-    assert_eq!(&mm.ram[pfn1 * PAGE_SIZE + 4094..pfn1 * PAGE_SIZE + 4096], &[0xAA, 0xBB]);
-    assert_eq!(&mm.ram[pfn2 * PAGE_SIZE..pfn2 * PAGE_SIZE + 4], &[0xCC, 0xDD, 0xEE, 0xFF]);
+    let mut first_page_tail = [0u8; 2];
+    let mut second_page_head = [0u8; 4];
+    mm.read_physical(pfn1 * PAGE_SIZE + 4094, &mut first_page_tail)
+        .unwrap();
+    mm.read_physical(pfn2 * PAGE_SIZE, &mut second_page_head)
+        .unwrap();
+    assert_eq!(first_page_tail, [0xAA, 0xBB]);
+    assert_eq!(second_page_head, [0xCC, 0xDD, 0xEE, 0xFF]);
 
     // 跨页读取验证
     let mut read_buf = [0u8; 6];
-    let read_n = mm.read_virtual_checked(&mut space, 0x1FFE, &mut read_buf, false).unwrap();
+    let read_n = mm
+        .read_virtual_checked(&mut space, 0x1FFE, &mut read_buf, false)
+        .unwrap();
     assert_eq!(read_n, 6);
     assert_eq!(read_buf, payload);
 
     // 测试只读页权限拦截
-    let _ = space.allocate_and_map(&mut mm.buddy, 0x3000, FLAG_PRESENT).unwrap(); // 无 FLAG_WRITABLE
+    let _ = space
+        .allocate_and_map(&mut mm, 0x3000, FLAG_PRESENT)
+        .unwrap(); // 无 FLAG_WRITABLE
     let write_res = mm.write_virtual_checked(&mut space, 0x3000, &[1, 2, 3], false);
     assert!(write_res.is_err()); // 必须返回权限拒绝错误
 }
@@ -243,11 +295,15 @@ fn test_remapping_and_address_space_destroy() {
     let initial_free = mm.buddy.stats.free_pages;
 
     // 分配并映射 0x4000
-    space.allocate_and_map(&mut mm.buddy, 0x4000, FLAG_PRESENT | FLAG_WRITABLE).unwrap();
+    space
+        .allocate_and_map(&mut mm, 0x4000, FLAG_PRESENT | FLAG_WRITABLE)
+        .unwrap();
     assert_eq!(mm.buddy.stats.free_pages, initial_free - 1);
 
     // 重复映射同一虚拟页 0x4000：旧物理页必须被自动回收，不发生泄漏
-    space.allocate_and_map(&mut mm.buddy, 0x4000, FLAG_PRESENT | FLAG_WRITABLE).unwrap();
+    space
+        .allocate_and_map(&mut mm, 0x4000, FLAG_PRESENT | FLAG_WRITABLE)
+        .unwrap();
     assert_eq!(mm.buddy.stats.free_pages, initial_free - 1);
 
     // 销毁地址空间：所有物理页 100% 归还
@@ -278,7 +334,9 @@ fn test_vfs_unlink_non_empty_directory_atomicity() {
 fn test_vfs_file_permissions_and_append() {
     let mut vfs = VirtualFileSystem::new(512, 16);
 
-    let fd_write = vfs.open("/test_mode.txt", fs::O_CREAT | fs::O_WRONLY).unwrap();
+    let fd_write = vfs
+        .open("/test_mode.txt", fs::O_CREAT | fs::O_WRONLY)
+        .unwrap();
     vfs.write(fd_write, b"initial ").unwrap();
     vfs.close(fd_write).unwrap();
 
@@ -289,7 +347,9 @@ fn test_vfs_file_permissions_and_append() {
     vfs.close(fd_ro).unwrap();
 
     // 以追加模式打开写入，自动动态移动到末尾
-    let fd_app = vfs.open("/test_mode.txt", fs::O_WRONLY | fs::O_APPEND).unwrap();
+    let fd_app = vfs
+        .open("/test_mode.txt", fs::O_WRONLY | fs::O_APPEND)
+        .unwrap();
     vfs.write(fd_app, b"appended").unwrap();
     vfs.close(fd_app).unwrap();
 
@@ -307,22 +367,70 @@ fn test_fork_memory_isolation() {
     // 获取 init 进程 (PID 1)
     let parent_pid = 1;
     // 写入父进程虚拟内存 0x8000
-    kernel.mm.write_virtual(&mut kernel.pm.processes.get_mut(&parent_pid).unwrap().address_space, 0x8000, b"PARENT").unwrap();
+    kernel
+        .mm
+        .write_virtual(
+            &mut kernel
+                .pm
+                .processes
+                .get_mut(&parent_pid)
+                .unwrap()
+                .address_space,
+            0x8000,
+            b"PARENT",
+        )
+        .unwrap();
 
     // Fork 子进程
     let child_pid = kernel.fork_process(parent_pid).unwrap();
 
     // 验证子进程初始读取到父进程数据
     let mut child_buf = [0u8; 6];
-    kernel.mm.read_virtual(&mut kernel.pm.processes.get_mut(&child_pid).unwrap().address_space, 0x8000, &mut child_buf).unwrap();
+    kernel
+        .mm
+        .read_virtual(
+            &mut kernel
+                .pm
+                .processes
+                .get_mut(&child_pid)
+                .unwrap()
+                .address_space,
+            0x8000,
+            &mut child_buf,
+        )
+        .unwrap();
     assert_eq!(&child_buf, b"PARENT");
 
     // 修改子进程虚拟内存
-    kernel.mm.write_virtual(&mut kernel.pm.processes.get_mut(&child_pid).unwrap().address_space, 0x8000, b"CHILD!").unwrap();
+    kernel
+        .mm
+        .write_virtual(
+            &mut kernel
+                .pm
+                .processes
+                .get_mut(&child_pid)
+                .unwrap()
+                .address_space,
+            0x8000,
+            b"CHILD!",
+        )
+        .unwrap();
 
     // 验证父进程内存保持不变（完全隔离）
     let mut parent_buf = [0u8; 6];
-    kernel.mm.read_virtual(&mut kernel.pm.processes.get_mut(&parent_pid).unwrap().address_space, 0x8000, &mut parent_buf).unwrap();
+    kernel
+        .mm
+        .read_virtual(
+            &mut kernel
+                .pm
+                .processes
+                .get_mut(&parent_pid)
+                .unwrap()
+                .address_space,
+            0x8000,
+            &mut parent_buf,
+        )
+        .unwrap();
     assert_eq!(&parent_buf, b"PARENT");
 }
 
@@ -330,15 +438,31 @@ fn test_fork_memory_isolation() {
 fn test_tlb_invalidation_and_slot_reuse() {
     let mut tlb = mini_os_kernel::mm::Tlb::new(4);
 
-    tlb.insert(mini_os_kernel::mm::TlbEntry { vpn: 1, pfn: 10, flags: 1 });
-    tlb.insert(mini_os_kernel::mm::TlbEntry { vpn: 2, pfn: 20, flags: 1 });
-    tlb.insert(mini_os_kernel::mm::TlbEntry { vpn: 3, pfn: 30, flags: 1 });
+    tlb.insert(mini_os_kernel::mm::TlbEntry {
+        vpn: 1,
+        pfn: 10,
+        flags: 1,
+    });
+    tlb.insert(mini_os_kernel::mm::TlbEntry {
+        vpn: 2,
+        pfn: 20,
+        flags: 1,
+    });
+    tlb.insert(mini_os_kernel::mm::TlbEntry {
+        vpn: 3,
+        pfn: 30,
+        flags: 1,
+    });
 
     // 使条目 1 失效
     tlb.invalidate(1);
 
     // 插入新条目 4，必须复用空出的槽位，不得破坏条目 2 和 3
-    tlb.insert(mini_os_kernel::mm::TlbEntry { vpn: 4, pfn: 40, flags: 1 });
+    tlb.insert(mini_os_kernel::mm::TlbEntry {
+        vpn: 4,
+        pfn: 40,
+        flags: 1,
+    });
 
     assert!(tlb.lookup(2).is_some());
     assert!(tlb.lookup(3).is_some());

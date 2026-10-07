@@ -1,5 +1,5 @@
 //! 物理页伙伴系统 (Buddy Allocator)
-//! 
+//!
 //! 高性能特性：
 //! 1. 按 2 的幂次方对齐管理物理页框 (Page Frames)
 //! 2. 位运算 O(1) 伙伴地址计算：buddy_pfn = pfn ^ (1 << order)

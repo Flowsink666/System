@@ -119,34 +119,38 @@ impl BufferCache {
 
     /// 维护 LRU 访问位
     fn touch_lru(&mut self, block_idx: usize) {
+        if self.lru_list.back() == Some(&block_idx) {
+            return; // 已经是最热块，跳过线性扫描
+        }
         if let Some(pos) = self.lru_list.iter().position(|&x| x == block_idx) {
             self.lru_list.remove(pos);
         }
         self.lru_list.push_back(block_idx);
     }
 
-    /// 当容量满时执行 LRU 淘汰
+    /// 当容量满时执行 LRU 淘汰（先成功写回脏数据，再从缓存移除，防止写失败丢失数据）
     fn ensure_capacity(&mut self, dev: &mut VirtualBlockDevice) -> Result<(), &'static str> {
-        if self.cache.len() >= self.capacity {
-            if let Some(evicted_idx) = self.lru_list.pop_front() {
-                if let Some(evicted_block) = self.cache.remove(&evicted_idx) {
-                    if evicted_block.is_dirty {
-                        dev.write_block(evicted_block.block_idx, &evicted_block.data)?;
-                        self.writebacks += 1;
-                    }
-                }
+        if self.cache.len() >= self.capacity
+            && let Some(&evicted_idx) = self.lru_list.front()
+        {
+            if let Some(block) = self.cache.get(&evicted_idx)
+                && block.is_dirty
+            {
+                dev.write_block(block.block_idx, &block.data)?;
+                self.writebacks += 1;
             }
+            self.lru_list.pop_front();
+            self.cache.remove(&evicted_idx);
         }
         Ok(())
     }
 
     /// 废弃指定块的缓存项（用于文件删除或截断释放块时避免脏数据残留）
     pub fn invalidate(&mut self, block_idx: usize) {
-        if self.cache.remove(&block_idx).is_some() {
-            if let Some(pos) = self.lru_list.iter().position(|&x| x == block_idx) {
+        if self.cache.remove(&block_idx).is_some()
+            && let Some(pos) = self.lru_list.iter().position(|&x| x == block_idx) {
                 self.lru_list.remove(pos);
             }
-        }
     }
 
     /// 计算缓存命中率

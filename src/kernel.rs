@@ -1,11 +1,11 @@
 //! 核心内核聚合模块 (Kernel Core Orchestrator)
-//! 
+//!
 //! 统筹虚拟 CPU、时钟、内存管理系统、进程调度系统与文件系统的全生命周期协同
 
 use crate::arch::{PrivilegeLevel, VirtualCpu, VirtualTimer};
-use crate::fs::{VirtualFileSystem, O_CREAT, O_RDWR, O_TRUNC};
+use crate::fs::{O_CREAT, O_RDWR, O_TRUNC, VirtualFileSystem};
 use crate::mm::MemoryManager;
-use crate::sched::{ProcessManager, ProcessState};
+use crate::sched::{BlockedReason, ProcessManager, ProcessState, ScheduleEvent};
 use crate::syscall::{SyscallArgs, SyscallDispatcher};
 
 pub struct KernelStats {
@@ -32,9 +32,10 @@ pub struct KernelStats {
 pub struct Kernel {
     pub cpu: VirtualCpu,
     pub timer: VirtualTimer,
-    pub mm: MemoryManager,
     pub pm: ProcessManager,
+    pub mm: Box<MemoryManager>,
     pub vfs: VirtualFileSystem,
+    loaded_pid: Option<usize>,
 }
 
 impl Kernel {
@@ -43,9 +44,10 @@ impl Kernel {
         let mut kernel = Self {
             cpu: VirtualCpu::new(),
             timer: VirtualTimer::new(1000), // 1000ns 每 tick
-            mm: MemoryManager::new(total_ram_pages),
             pm: ProcessManager::new(1000),
+            mm: Box::new(MemoryManager::new(total_ram_pages)),
             vfs: VirtualFileSystem::new(total_disk_blocks, cache_capacity),
+            loaded_pid: None,
         };
 
         kernel.bootstrap_filesystem();
@@ -70,7 +72,8 @@ impl Kernel {
         }
 
         if let Ok(fd) = self.vfs.open("/etc/motd", O_CREAT | O_RDWR | O_TRUNC) {
-            let motd = b"Welcome to Mini-OS Kernel (CFS Scheduler, Buddy+Slab MM, Extent/LRU VFS)!\n";
+            let motd =
+                b"Welcome to Mini-OS Kernel (CFS Scheduler, Buddy+Slab MM, Extent/LRU VFS)!\n";
             let _ = self.vfs.write(fd, motd);
             let _ = self.vfs.close(fd);
         }
@@ -88,19 +91,37 @@ impl Kernel {
         if let Some(proc) = self.pm.processes.get_mut(&init_pid) {
             let _ = proc
                 .address_space
-                .allocate_and_map(&mut self.mm.buddy, 0x1000, 0x5);
+                .allocate_and_map(&mut self.mm, 0x1000, 0x5);
             let _ = proc
                 .address_space
-                .allocate_and_map(&mut self.mm.buddy, 0x8000, 0x3);
+                .allocate_and_map(&mut self.mm, 0x8000, 0x7);
+            self.cpu.context = proc.context;
+            self.cpu.privilege = PrivilegeLevel::Ring3User;
+            self.loaded_pid = Some(init_pid);
         }
     }
 
     /// 复制进程及其完整地址空间 (Fork)
     pub fn fork_process(&mut self, parent_pid: usize) -> Result<usize, &'static str> {
-        let child_pid = self.pm.fork_pcb(parent_pid)?;
-        let parent_space = &self.pm.processes.get(&parent_pid).unwrap().address_space;
-        let cloned_space = parent_space.fork_clone(&mut self.mm.buddy, &mut self.mm.ram)?;
+        let parent_space = &self
+            .pm
+            .processes
+            .get(&parent_pid)
+            .ok_or("Parent process not found")?
+            .address_space;
+        let cloned_space = parent_space.fork_clone(&mut self.mm)?;
+        let child_pid = match self.pm.fork_pcb(parent_pid) {
+            Ok(pid) => pid,
+            Err(e) => {
+                let mut space = cloned_space;
+                space.destroy(&mut self.mm.buddy);
+                return Err(e);
+            }
+        };
         if let Some(child_proc) = self.pm.processes.get_mut(&child_pid) {
+            for fd_entry in child_proc.fd_table.values() {
+                let _ = self.vfs.dup_fd(fd_entry.vfs_fd);
+            }
             child_proc.address_space = cloned_space;
         }
         Ok(child_pid)
@@ -108,21 +129,23 @@ impl Kernel {
 
     /// 终止进程并完整回收其地址空间、物理页框与文件句柄
     pub fn terminate_process(&mut self, pid: usize, exit_code: i32) -> Result<(), &'static str> {
-        let ppid = {
+        let (ppid, vruntime, weight) = {
             let proc = self.pm.processes.get_mut(&pid).ok_or("Process not found")?;
             proc.address_space.destroy(&mut self.mm.buddy);
-            for fd_entry in proc.fd_table.values() {
+            for fd_entry in std::mem::take(&mut proc.fd_table).into_values() {
                 let _ = self.vfs.close(fd_entry.vfs_fd);
             }
             proc.state = ProcessState::Zombie;
             proc.exit_code = exit_code;
-            proc.ppid
+            (proc.ppid, proc.vruntime, proc.weight)
         };
 
+        // 从调度器就绪队列中出队
+        self.pm.scheduler.dequeue_task(pid, vruntime, weight);
+
         // 唤醒可能正在 waitpid 等待的父进程
-        if ppid > 0 {
-            self.pm.wake(ppid);
-        }
+        self.pm.wake(ppid, BlockedReason::WaitingChild { pid });
+        self.timer.cancel_sleep(pid);
 
         // 若为孤儿进程或 init，彻底移除
         if ppid == 0 || pid == 1 {
@@ -131,6 +154,9 @@ impl Kernel {
 
         if self.pm.current_pid == Some(pid) {
             self.pm.current_pid = None;
+        }
+        if self.loaded_pid == Some(pid) {
+            self.load_cpu_context(None);
         }
 
         Ok(())
@@ -143,46 +169,113 @@ impl Kernel {
         for _ in 0..ticks {
             // 1. 定时器步进，唤醒休眠进程
             let awakened = self.timer.tick();
-            for pid in awakened {
-                self.pm.wake(pid);
-                log.push(format!("[Timer] Awakened sleeping process PID {}", pid));
+            for event in awakened {
+                if self
+                    .pm
+                    .wake(event.pid, BlockedReason::Sleeping { token: event.token })
+                {
+                    log.push(format!(
+                        "[Timer] Awakened sleeping process PID {}",
+                        event.pid
+                    ));
+                }
             }
 
             // 2. 推进调度器
-            let (current_pid, event, context_switched) = self.pm.schedule_step(1);
-
-            // 3. CPU 硬件级上下文切换执行链
-            if context_switched {
-                if let Some(pid) = current_pid {
-                    if let Some(proc) = self.pm.processes.get(&pid) {
-                        self.cpu.switch_to(&proc.context, PrivilegeLevel::Ring3User);
-                    }
-                } else {
-                    self.cpu.privilege = PrivilegeLevel::Ring0Kernel;
-                }
-            }
-
-            // 4. 步进指令并保存现场
-            if let Some(pid) = current_pid {
-                self.cpu.step(10); // 假定每调度周期运行 10 条指令
-                if let Some(proc) = self.pm.processes.get_mut(&pid) {
-                    proc.context = self.cpu.context;
-                    // 模拟指令执行访问虚拟内存，触发 TLB / 缺页测试
-                    let _ = proc.address_space.translate(0x1000);
-                }
-            }
-
+            let result = self.pm.schedule_step(1);
+            let event = self.apply_schedule_result(result, true);
             log.push(event.display(&self.pm.processes));
         }
 
         log
     }
 
+    /// 统一提交调度结果，完成最后一个 tick 后再清理退出资源。
+    fn apply_schedule_result(
+        &mut self,
+        (pid, event, _switched): (Option<usize>, ScheduleEvent, bool),
+        execute: bool,
+    ) -> ScheduleEvent {
+        self.load_cpu_context(pid);
+        if execute && let Some(pid) = pid {
+            self.cpu.step(10);
+            if let Some(proc) = self.pm.processes.get_mut(&pid) {
+                proc.context = self.cpu.context;
+                let _ = proc.address_space.translate(0x1000);
+            }
+        }
+        if let ScheduleEvent::Terminated { pid } = event {
+            self.terminate_process(pid, 0)
+                .expect("Scheduled process must exist");
+        }
+        event
+    }
+
+    fn load_cpu_context(&mut self, pid: Option<usize>) {
+        if self.loaded_pid != pid {
+            self.save_cpu_context();
+        }
+        if let Some(pid) = pid {
+            if self.loaded_pid != Some(pid) {
+                let proc = self
+                    .pm
+                    .processes
+                    .get(&pid)
+                    .expect("Selected process must exist");
+                self.cpu.switch_to(&proc.context, PrivilegeLevel::Ring3User);
+                self.loaded_pid = Some(pid);
+            }
+            self.cpu.privilege = PrivilegeLevel::Ring3User;
+        } else {
+            self.loaded_pid = None;
+            self.cpu.privilege = PrivilegeLevel::Ring0Kernel;
+        }
+    }
+
+    fn save_cpu_context(&mut self) {
+        if let Some(pid) = self.loaded_pid
+            && let Some(proc) = self.pm.processes.get_mut(&pid)
+        {
+            proc.context = self.cpu.context;
+        }
+    }
+
+    pub fn yield_current(&mut self) -> Result<(), &'static str> {
+        let pid = self.pm.current_pid.ok_or("No current process context")?;
+        let proc = self
+            .pm
+            .processes
+            .get(&pid)
+            .ok_or("Current process not found")?;
+        if proc.cpu_burst_remaining == 0 {
+            self.terminate_process(pid, 0)?;
+        }
+        let result = self.pm.yield_current();
+        self.apply_schedule_result(result, false);
+        Ok(())
+    }
+
+    pub fn sleep_current(&mut self, ticks: u64) -> Result<(), &'static str> {
+        let pid = self.pm.current_pid.ok_or("No current process context")?;
+        if !self.pm.processes.contains_key(&pid) {
+            return Err("Current process not found");
+        }
+        if ticks == 0 {
+            return self.yield_current();
+        }
+        let token = self.timer.add_sleep(pid, ticks)?;
+        self.pm.block(pid, BlockedReason::Sleeping { token });
+        self.load_cpu_context(None);
+        Ok(())
+    }
+
     /// 执行系统调用
     pub fn syscall(&mut self, args: SyscallArgs) -> Result<isize, &'static str> {
+        self.load_cpu_context(self.pm.current_pid);
+        self.save_cpu_context();
         self.cpu.privilege = PrivilegeLevel::Ring0Kernel;
-        let res = SyscallDispatcher::dispatch(args, &mut self.mm, &mut self.pm, &mut self.vfs);
-        self.cpu.privilege = PrivilegeLevel::Ring3User;
+        let res = SyscallDispatcher::dispatch(args, self);
+        self.load_cpu_context(self.pm.current_pid);
         res
     }
 

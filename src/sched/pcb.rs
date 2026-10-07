@@ -15,22 +15,18 @@ pub enum ProcessState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockedReason {
-    Sleeping,
+    Sleeping { token: u64 },
     WaitingIpc,
-    WaitingChild,
+    WaitingChild { pid: usize },
     WaitingIo,
 }
 
 /// Linux CFS 静态权重对照表 (-20 到 +19，索引 0..39)
 pub const PRIO_TO_WEIGHT: [u64; 40] = [
-    /* -20 */ 88761, 71755, 56483, 46273, 36291,
-    /* -15 */ 29154, 23254, 18705, 14949, 11916,
-    /* -10 */  9548,  7620,  6100,  4904,  3906,
-    /*  -5 */  3121,  2501,  1991,  1586,  1277,
-    /*   0 */  1024,   820,   655,   526,   423,
-    /*   5 */   335,   272,   215,   172,   137,
-    /*  10 */   110,    87,    70,    56,    45,
-    /*  15 */    36,    29,    23,    18,    15,
+    /* -20 */ 88761, 71755, 56483, 46273, 36291, /* -15 */ 29154, 23254, 18705, 14949,
+    11916, /* -10 */ 9548, 7620, 6100, 4904, 3906, /*  -5 */ 3121, 2501, 1991, 1586,
+    1277, /*   0 */ 1024, 820, 655, 526, 423, /*   5 */ 335, 272, 215, 172, 137,
+    /*  10 */ 110, 87, 70, 56, 45, /*  15 */ 36, 29, 23, 18, 15,
 ];
 
 pub const NICE_0_LOAD: u64 = 1024;
@@ -57,24 +53,24 @@ pub struct ProcessControlBlock {
     pub ppid: usize,
     pub name: String,
     pub state: ProcessState,
-    
+
     // CPU 寄存器上下文
     pub context: CpuContext,
-    
+
     // CFS 调度属性
-    pub nice: i8,              // -20 ~ 19
-    pub weight: u64,           // 调度权重
-    pub vruntime: u64,         // 虚拟运行时间 (nanoseconds)
-    pub exec_time: u64,        // 累计运行物理时间 (nanoseconds)
-    pub cpu_burst_remaining: u64, // 当前任务剩余需要执行的时钟周期
+    pub nice: i8,                  // -20 ~ 19
+    pub weight: u64,               // 调度权重
+    pub vruntime: u64,             // 虚拟运行时间 (nanoseconds)
+    pub exec_time: u64,            // 累计运行物理时间 (nanoseconds)
+    pub cpu_burst_remaining: u64,  // 当前任务剩余需要执行的时钟周期
     pub time_slice_remaining: u64, // 当前时间片剩余周期
-    
+
     // 内存与资源
     pub address_space: AddressSpace,
     pub vma_list: Vec<Vma>,
     pub fd_table: HashMap<usize, FileDescriptorEntry>,
     pub next_fd: usize,
-    
+
     // 退出状态
     pub exit_code: i32,
 }
@@ -87,9 +83,27 @@ impl ProcessControlBlock {
 
         let mut fd_table = HashMap::new();
         // 预分配 stdin(0), stdout(1), stderr(2)
-        fd_table.insert(0, FileDescriptorEntry { vfs_fd: 0, flags: 0 });
-        fd_table.insert(1, FileDescriptorEntry { vfs_fd: 1, flags: 1 });
-        fd_table.insert(2, FileDescriptorEntry { vfs_fd: 2, flags: 1 });
+        fd_table.insert(
+            0,
+            FileDescriptorEntry {
+                vfs_fd: 0,
+                flags: 0,
+            },
+        );
+        fd_table.insert(
+            1,
+            FileDescriptorEntry {
+                vfs_fd: 1,
+                flags: 1,
+            },
+        );
+        fd_table.insert(
+            2,
+            FileDescriptorEntry {
+                vfs_fd: 2,
+                flags: 1,
+            },
+        );
 
         Self {
             pid,
@@ -105,8 +119,18 @@ impl ProcessControlBlock {
             time_slice_remaining: 10,
             address_space: AddressSpace::new(64),
             vma_list: vec![
-                Vma { start_va: 0x1000, end_va: 0x8000, flags: 0x5, name: "code".into() },
-                Vma { start_va: 0x8000, end_va: 0x10000, flags: 0x3, name: "data".into() },
+                Vma {
+                    start_va: 0x1000,
+                    end_va: 0x8000,
+                    flags: 0x5,
+                    name: "code".into(),
+                },
+                Vma {
+                    start_va: 0x8000,
+                    end_va: 0x10000,
+                    flags: 0x3,
+                    name: "data".into(),
+                },
             ],
             fd_table,
             next_fd: 3,
@@ -118,12 +142,16 @@ impl ProcessControlBlock {
     pub fn update_vruntime(&mut self, delta_exec: u64) {
         self.exec_time += delta_exec;
         // delta_vruntime = delta_exec * (NICE_0_LOAD / weight)
-        let delta_vruntime = (delta_exec as u128 * NICE_0_LOAD as u128 / self.weight as u128) as u64;
+        let delta_vruntime =
+            (delta_exec as u128 * NICE_0_LOAD as u128 / self.weight as u128) as u64;
         self.vruntime = self.vruntime.saturating_add(delta_vruntime);
     }
 
     /// 分配新的文件描述符
     pub fn alloc_fd(&mut self, entry: FileDescriptorEntry) -> usize {
+        while self.fd_table.contains_key(&self.next_fd) {
+            self.next_fd += 1;
+        }
         let fd = self.next_fd;
         self.next_fd += 1;
         self.fd_table.insert(fd, entry);

@@ -33,6 +33,7 @@ pub struct VfsOpenFile {
     pub inode_id: usize,
     pub offset: usize,
     pub flags: u32,
+    pub ref_count: usize,
 }
 
 pub struct VirtualFileSystem {
@@ -42,6 +43,7 @@ pub struct VirtualFileSystem {
     pub directories: HashMap<usize, Directory>,
     pub free_blocks: Vec<usize>,
     pub open_files: HashMap<usize, VfsOpenFile>,
+    pub unlinked_inodes: std::collections::HashSet<usize>,
     next_inode_id: usize,
     next_fd: usize,
     pub root_inode_id: usize,
@@ -74,6 +76,7 @@ impl VirtualFileSystem {
             directories,
             free_blocks,
             open_files: HashMap::new(),
+            unlinked_inodes: std::collections::HashSet::new(),
             next_inode_id: 1,
             next_fd: 10, // 0,1,2 保留给 stdio
             root_inode_id,
@@ -207,10 +210,18 @@ impl VirtualFileSystem {
                 inode_id,
                 offset,
                 flags,
+                ref_count: 1,
             },
         );
 
         Ok(fd)
+    }
+
+    /// 复制全局打开文件描述符引用 (fork 或 dup)
+    pub fn dup_fd(&mut self, fd: usize) -> Result<(), &'static str> {
+        let file = self.open_files.get_mut(&fd).ok_or("Invalid file descriptor")?;
+        file.ref_count += 1;
+        Ok(())
     }
 
     /// 读取文件 (受读模式权限检查约束)
@@ -240,9 +251,14 @@ impl VirtualFileSystem {
         }
         let inode_id = file.inode_id;
 
+        let inode = self.inodes.get(&inode_id).ok_or("Inode not found")?;
+        if inode.inode_type == InodeType::Directory {
+            return Err("Cannot write to directory");
+        }
+
         // O_APPEND 必须动态重定位到最新文件末尾
         if (file.flags & O_APPEND) != 0 {
-            let curr_size = self.inodes.get(&inode_id).unwrap().size;
+            let curr_size = inode.size;
             file.offset = curr_size;
         }
         let offset = file.offset;
@@ -270,15 +286,49 @@ impl VirtualFileSystem {
 
     /// 关闭文件
     pub fn close(&mut self, fd: usize) -> Result<(), &'static str> {
-        self.open_files.remove(&fd).ok_or("Invalid file descriptor")?;
+        let (inode_id, should_remove_fd) = {
+            let file = self.open_files.get_mut(&fd).ok_or("Invalid file descriptor")?;
+            if file.ref_count > 1 {
+                file.ref_count -= 1;
+                (file.inode_id, false)
+            } else {
+                (file.inode_id, true)
+            }
+        };
+
+        if should_remove_fd {
+            self.open_files.remove(&fd);
+            // 检查该 inode 是否已被 unlink 且已无其它打开句柄引用
+            if self.unlinked_inodes.contains(&inode_id) {
+                let still_open = self.open_files.values().any(|f| f.inode_id == inode_id);
+                if !still_open {
+                    self.unlinked_inodes.remove(&inode_id);
+                    if let Some(mut inode) = self.inodes.remove(&inode_id) {
+                        let old_blocks = inode.release_all_blocks(&mut self.cache, &mut self.dev);
+                        for b in &old_blocks {
+                            self.cache.invalidate(*b);
+                        }
+                        self.free_blocks.extend(old_blocks);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
     /// 删除文件或目录 (遵循先校验、后提交事务机制，防止破坏目录树结构)
     pub fn unlink(&mut self, path: &str) -> Result<(), &'static str> {
         let (parent_id, name) = self.resolve_parent_and_name(path)?;
+        if name == "." || name == ".." {
+            return Err("Cannot unlink . or ..");
+        }
+
         let parent_dir = self.directories.get(&parent_id).ok_or("Parent not found")?;
         let entry = parent_dir.lookup(name).ok_or("File not found")?.clone();
+
+        if entry.inode_id == self.root_inode_id {
+            return Err("Cannot unlink root directory");
+        }
 
         // 1. 先行校验：若为目录必须为空 (除 . 和 .. 外无文件)，若非空直接退出，绝不破坏父目录
         if entry.inode_type == InodeType::Directory {
@@ -290,14 +340,20 @@ impl VirtualFileSystem {
 
         // 2. 校验全部通过，提交变更：从父目录注销该目录项
         let parent_dir_mut = self.directories.get_mut(&parent_id).unwrap();
-        parent_dir_mut.remove_entry(name);
+        if parent_dir_mut.remove_entry(name).is_none() {
+            return Err("Failed to remove directory entry");
+        }
 
         if entry.inode_type == InodeType::Directory {
             self.directories.remove(&entry.inode_id);
         }
 
-        // 3. 彻底释放 Inode 并回收所有底层物理数据块到 free_blocks
-        if let Some(mut inode) = self.inodes.remove(&entry.inode_id) {
+        // 3. 释放 Inode 与数据块
+        // 若当前有打开句柄正在引用此 Inode，延迟到 close 时彻底销毁 (符合 POSIX 规范)
+        let is_open = self.open_files.values().any(|f| f.inode_id == entry.inode_id);
+        if is_open {
+            self.unlinked_inodes.insert(entry.inode_id);
+        } else if let Some(mut inode) = self.inodes.remove(&entry.inode_id) {
             let old_blocks = inode.release_all_blocks(&mut self.cache, &mut self.dev);
             for b in &old_blocks {
                 self.cache.invalidate(*b);
@@ -333,6 +389,9 @@ impl VirtualFileSystem {
 
         for entry in dir.list() {
             if let Some(inode) = self.inodes.get(&entry.inode_id) {
+                let total_blocks = inode.direct_blocks_used
+                    + inode.indirect_blocks_used
+                    + if inode.indirect_block.is_some() { 1 } else { 0 };
                 results.push((
                     entry.name,
                     FileStat {
@@ -340,7 +399,7 @@ impl VirtualFileSystem {
                         inode_type: inode.inode_type,
                         size: inode.size,
                         permissions: inode.permissions,
-                        blocks_used: inode.direct_blocks_used,
+                        blocks_used: total_blocks,
                     },
                 ));
             }

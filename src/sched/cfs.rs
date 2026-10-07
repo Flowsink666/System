@@ -1,7 +1,7 @@
 //! 完全公平调度器 (Completely Fair Scheduler - CFS)
 //! 
 //! 高性能特性：
-//! 1. 基于红黑平衡结构 (BTreeSet) 实现 O(log N) 插入/删除与 O(1) 极速挑选最小 vruntime 任务
+//! 1. 基于 B-Tree 就绪树结构 (BTreeSet) 实现 O(log N) 插入/删除与 pop_first() 单趟提取最小 vruntime 任务
 //! 2. 严格按 Linux 40 级 Nice 权重分配 CPU 时间配额
 //! 3. 动态时间片计算 (Dynamic Time Slice) 与最小粒度保护 (Min Granularity)
 //! 4. 维护全局单调递增 min_vruntime，防止新任务或休眠唤醒任务长期霸占 CPU
@@ -10,7 +10,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 pub struct CfsScheduler {
-    /// 就绪红黑树队列：元素为 (vruntime, pid)
+    /// 就绪平衡树队列：元素为 (vruntime, pid)
     runqueue: BTreeSet<(u64, usize)>,
     /// 任务入队元数据索引: pid -> (normalized_vruntime, weight)
     enqueued_tasks: HashMap<usize, (u64, u64)>,
@@ -72,10 +72,9 @@ impl CfsScheduler {
         self.dequeue_task_by_pid(pid)
     }
 
-    /// 极速挑选下一个最应获得 CPU 的进程：O(1) 获取红黑树最左节点并从就绪队列移除
+    /// 极速挑选下一个最应获得 CPU 的进程：单次遍历弹出 BTree 最左最小节点
     pub fn pick_next_task(&mut self) -> Option<usize> {
-        if let Some(&(vruntime, pid)) = self.runqueue.iter().next() {
-            self.runqueue.remove(&(vruntime, pid));
+        if let Some((_, pid)) = self.runqueue.pop_first() {
             if let Some((_, weight)) = self.enqueued_tasks.remove(&pid) {
                 self.total_weight = self.total_weight.saturating_sub(weight);
             }
@@ -106,11 +105,10 @@ impl CfsScheduler {
 
     /// 检查是否有就绪任务的虚拟运行时间落后当前任务超过 min_granularity_ns，若超过则触发抢占
     pub fn check_preempt(&self, current_vruntime: u64) -> bool {
-        if let Some(&(leftmost_vruntime, _)) = self.runqueue.iter().next() {
-            if leftmost_vruntime + self.min_granularity_ns < current_vruntime {
+        if let Some(&(leftmost_vruntime, _)) = self.runqueue.iter().next()
+            && leftmost_vruntime + self.min_granularity_ns < current_vruntime {
                 return true;
             }
-        }
         false
     }
 

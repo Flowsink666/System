@@ -1,0 +1,8 @@
+
+running 3 tests
+test child_exit_must_not_interrupt_parent_sleep ... ok
+test yield_must_not_execute_or_prematurely_finish_process ... ok
+test yield_switch_must_load_selected_cpu_context ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

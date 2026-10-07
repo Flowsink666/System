@@ -29,17 +29,15 @@ impl Pipe {
         }
         let available = self.capacity.saturating_sub(self.buffer.len());
         let to_write = data.len().min(available);
-        for &byte in &data[..to_write] {
-            self.buffer.push_back(byte);
-        }
+        self.buffer.extend(data[..to_write].iter().copied());
         Ok(to_write)
     }
 
     /// 读取数据
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
         let to_read = buf.len().min(self.buffer.len());
-        for slot in buf.iter_mut().take(to_read) {
-            *slot = self.buffer.pop_front().unwrap();
+        for (slot, byte) in buf.iter_mut().take(to_read).zip(self.buffer.drain(..to_read)) {
+            *slot = byte;
         }
         to_read
     }

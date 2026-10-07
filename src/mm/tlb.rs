@@ -34,40 +34,45 @@ impl Tlb {
         }
     }
 
+    #[inline]
+    fn touch_lru(&mut self, idx: usize) {
+        if self.lru_order.back() == Some(&idx) {
+            return;
+        }
+        if let Some(pos) = self.lru_order.iter().position(|&x| x == idx) {
+            self.lru_order.remove(pos);
+        }
+        self.lru_order.push_back(idx);
+    }
+
     /// 查询虚拟页号对应的物理页帧
     pub fn lookup(&mut self, vpn: usize) -> Option<TlbEntry> {
-        for (idx, entry_opt) in self.entries.iter().enumerate() {
-            if let Some(entry) = entry_opt {
-                if entry.vpn == vpn {
-                    self.hits += 1;
-                    // 更新 LRU 顺序
-                    if let Some(pos) = self.lru_order.iter().position(|&x| x == idx) {
-                        self.lru_order.remove(pos);
-                    }
-                    self.lru_order.push_back(idx);
-                    return Some(*entry);
+        let found = self.entries.iter().enumerate().find_map(|(idx, entry_opt)| {
+            if let Some(entry) = entry_opt
+                && entry.vpn == vpn {
+                    Some((idx, *entry))
+                } else {
+                    None
                 }
-            }
-        }
+        });
 
-        self.misses += 1;
-        None
+        if let Some((idx, entry)) = found {
+            self.hits += 1;
+            self.touch_lru(idx);
+            Some(entry)
+        } else {
+            self.misses += 1;
+            None
+        }
     }
 
     /// 插入或更新 TLB 项
     pub fn insert(&mut self, entry: TlbEntry) {
         // 如果已经存在，直接更新
-        for (idx, entry_opt) in self.entries.iter_mut().enumerate() {
-            if let Some(e) = entry_opt {
-                if e.vpn == entry.vpn {
-                    *e = entry;
-                    if let Some(pos) = self.lru_order.iter().position(|&x| x == idx) {
-                        self.lru_order.remove(pos);
-                    }
-                    self.lru_order.push_back(idx);
-                    return;
-                }
-            }
+        if let Some(pos) = self.entries.iter().position(|e| matches!(e, Some(x) if x.vpn == entry.vpn)) {
+            self.entries[pos] = Some(entry);
+            self.touch_lru(pos);
+            return;
         }
 
         // 寻找空闲槽位 (None) 或根据 LRU 淘汰最久未访问项
@@ -87,15 +92,14 @@ impl Tlb {
     /// 使特定虚拟页号失效
     pub fn invalidate(&mut self, vpn: usize) {
         for (idx, entry_opt) in self.entries.iter_mut().enumerate() {
-            if let Some(e) = entry_opt {
-                if e.vpn == vpn {
+            if let Some(e) = entry_opt
+                && e.vpn == vpn {
                     *entry_opt = None;
                     if let Some(pos) = self.lru_order.iter().position(|&x| x == idx) {
                         self.lru_order.remove(pos);
                     }
                     break;
                 }
-            }
         }
     }
 

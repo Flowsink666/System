@@ -1,5 +1,5 @@
 //! 多级页表与虚拟内存管理 (Multi-Level Page Tables & Virtual Memory)
-//! 
+//!
 //! 高性能与高可靠特性：
 //! 1. 两级树形页表，重映射时自动释放旧物理页，杜绝物理页泄漏
 //! 2. 结合 TLB 快表实现单周期地址转换与精确权限校验 (读/写/用户态)
@@ -50,6 +50,12 @@ pub struct PageTableLevel2 {
     pub entries: [PageTableEntry; 1024],
 }
 
+impl Default for PageTableLevel2 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PageTableLevel2 {
     pub fn new() -> Self {
         Self {
@@ -63,17 +69,25 @@ pub struct PageDirectory {
     pub tables: Vec<Option<Box<PageTableLevel2>>>,
 }
 
+impl Default for PageDirectory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PageDirectory {
     pub fn new() -> Self {
-        let mut tables = Vec::with_capacity(1024);
-        for _ in 0..1024 {
-            tables.push(None);
+        Self {
+            tables: (0..1024).map(|_| None).collect(),
         }
-        Self { tables }
     }
 
     /// 映射虚拟页到物理页框。如果该页之前已被映射，返回原先的旧 PFN 供调用者释放
     pub fn map_page(&mut self, va: usize, pfn: usize, flags: u8) -> Option<usize> {
+        if va > 0xFFFF_FFFF {
+            return None;
+        }
+
         let pd_idx = (va >> 22) & 0x3FF;
         let pt_idx = (va >> 12) & 0x3FF;
 
@@ -98,6 +112,10 @@ impl PageDirectory {
 
     /// 解除虚拟地址映射
     pub fn unmap_page(&mut self, va: usize) -> Option<usize> {
+        if va > 0xFFFF_FFFF {
+            return None;
+        }
+
         let pd_idx = (va >> 22) & 0x3FF;
         let pt_idx = (va >> 12) & 0x3FF;
 
@@ -114,6 +132,10 @@ impl PageDirectory {
 
     /// 遍历多级页表进行纯软件地址转换 (Page Walk)
     pub fn walk(&self, va: usize) -> Option<(usize, u8)> {
+        if va > 0xFFFF_FFFF {
+            return None;
+        }
+
         let pd_idx = (va >> 22) & 0x3FF;
         let pt_idx = (va >> 12) & 0x3FF;
 
@@ -150,6 +172,11 @@ impl AddressSpace {
         access: AccessType,
         is_user: bool,
     ) -> Result<usize, &'static str> {
+        if va > 0xFFFF_FFFF {
+            self.page_faults += 1;
+            return Err("Page fault: virtual address out of 32-bit bounds");
+        }
+
         let vpn = va / PAGE_SIZE;
         let offset = va % PAGE_SIZE;
 
@@ -188,17 +215,26 @@ impl AddressSpace {
     /// 按需调页与映射分配。若该虚拟地址已有旧映射，自动将旧物理页归还 Buddy，杜绝泄露
     pub fn allocate_and_map(
         &mut self,
-        buddy: &mut BuddyAllocator,
+        mm: &mut super::MemoryManager,
         va: usize,
         flags: u8,
     ) -> Result<usize, &'static str> {
-        let pfn = buddy.allocate_pages(0).ok_or("Out of physical memory")?;
-        if let Some(old_pfn) = self.page_directory.map_page(va, pfn, flags) {
+        if va > 0xFFFF_FFFF {
+            return Err("Virtual address out of 32-bit bounds");
+        }
+
+        let effective_flags = flags | FLAG_PRESENT;
+        let pfn = mm.allocate_pages_zeroed(0)?;
+        if let Some(old_pfn) = self.page_directory.map_page(va, pfn, effective_flags) {
             // 归还被覆盖的旧物理页框
-            let _ = buddy.free_pages(old_pfn);
+            let _ = mm.buddy.free_pages(old_pfn);
         }
         let vpn = va / PAGE_SIZE;
-        self.tlb.insert(TlbEntry { vpn, pfn, flags });
+        self.tlb.insert(TlbEntry {
+            vpn,
+            pfn,
+            flags: effective_flags,
+        });
         Ok(pfn)
     }
 
@@ -208,6 +244,10 @@ impl AddressSpace {
         buddy: &mut BuddyAllocator,
         va: usize,
     ) -> Result<(), &'static str> {
+        if va > 0xFFFF_FFFF {
+            return Err("Virtual address out of 32-bit bounds");
+        }
+
         let vpn = va / PAGE_SIZE;
         self.tlb.invalidate(vpn);
         if let Some(pfn) = self.page_directory.unmap_page(va) {
@@ -231,12 +271,8 @@ impl AddressSpace {
     }
 
     /// 深度复制地址空间及其物理页数据 (Fork 时调用)
-    pub fn fork_clone(
-        &self,
-        buddy: &mut BuddyAllocator,
-        ram: &mut [u8],
-    ) -> Result<AddressSpace, &'static str> {
-        let mut new_space = AddressSpace::new(self.tlb.hits as usize + 64);
+    pub fn fork_clone(&self, mm: &mut super::MemoryManager) -> Result<AddressSpace, &'static str> {
+        let mut new_space = AddressSpace::new(self.tlb.capacity);
 
         for (pd_idx, table_opt) in self.page_directory.tables.iter().enumerate() {
             if let Some(table) = table_opt {
@@ -246,14 +282,20 @@ impl AddressSpace {
                         let parent_pfn = entry.pfn;
 
                         // 为子进程分配新的物理页框
-                        let child_pfn = buddy.allocate_pages(0).ok_or("Out of memory during fork")?;
-                        new_space.page_directory.map_page(va, child_pfn, entry.flags);
+                        let child_pfn = match mm.allocate_pages_zeroed(0) {
+                            Ok(pfn) => pfn,
+                            Err(e) => {
+                                new_space.destroy(&mut mm.buddy);
+                                return Err(e);
+                            }
+                        };
+                        new_space
+                            .page_directory
+                            .map_page(va, child_pfn, entry.flags);
 
-                        // 拷贝页面内容
-                        let parent_offset = parent_pfn * PAGE_SIZE;
-                        let child_offset = child_pfn * PAGE_SIZE;
-                        if parent_offset + PAGE_SIZE <= ram.len() && child_offset + PAGE_SIZE <= ram.len() {
-                            ram.copy_within(parent_offset..parent_offset + PAGE_SIZE, child_offset);
+                        if let Err(e) = mm.copy_page(parent_pfn, child_pfn) {
+                            new_space.destroy(&mut mm.buddy);
+                            return Err(e);
                         }
                     }
                 }

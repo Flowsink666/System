@@ -163,12 +163,20 @@ impl Inode {
         offset: usize,
         data: &[u8],
     ) -> Result<usize, &'static str> {
-        // 如果写入位置超过当前文件大小，零填充中间空洞 (Sparse file filling)
+        let end_pos = offset.checked_add(data.len()).ok_or("Write offset overflow")?;
+        if end_pos > MAX_FILE_BLOCKS * BLOCK_SIZE {
+            return Err("File size exceeds maximum supported capacity (70KB)");
+        }
+
+        // 如果写入位置超过当前文件大小，按块零填充中间空洞 (避免大空洞引发宿主机内存耗尽)
         if offset > self.size {
-            let hole_len = offset - self.size;
-            let zeroes = vec![0u8; hole_len];
-            let old_size = self.size;
-            self.write_bytes(cache, dev, free_blocks, old_size, &zeroes)?;
+            let zero_block = [0u8; BLOCK_SIZE];
+            let mut hole_written = self.size;
+            while hole_written < offset {
+                let to_write = (offset - hole_written).min(BLOCK_SIZE);
+                self.write_bytes(cache, dev, free_blocks, hole_written, &zero_block[..to_write])?;
+                hole_written += to_write;
+            }
         }
 
         let mut bytes_written = 0;
@@ -177,6 +185,7 @@ impl Inode {
             let current_pos = offset + bytes_written;
             let logical_block = current_pos / BLOCK_SIZE;
             let block_offset = current_pos % BLOCK_SIZE;
+            let chunk = (BLOCK_SIZE - block_offset).min(data.len() - bytes_written);
 
             // 如果该逻辑块还未分配物理块，分配新物理块
             let physical_block = match self.get_block_index(cache, dev, logical_block) {
@@ -195,12 +204,15 @@ impl Inode {
             };
 
             let mut block_data = [0u8; BLOCK_SIZE];
-            // 读取现有块内容
-            let _ = cache.read_block(dev, physical_block, &mut block_data);
-
-            let chunk = (BLOCK_SIZE - block_offset).min(data.len() - bytes_written);
-            block_data[block_offset..block_offset + chunk]
-                .copy_from_slice(&data[bytes_written..bytes_written + chunk]);
+            if chunk == BLOCK_SIZE {
+                // 整块覆盖优化：无需先从磁盘/缓存读取原数据，直接写入
+                block_data.copy_from_slice(&data[bytes_written..bytes_written + BLOCK_SIZE]);
+            } else {
+                // 部分块改写：保留原有未覆盖部分
+                let _ = cache.read_block(dev, physical_block, &mut block_data);
+                block_data[block_offset..block_offset + chunk]
+                    .copy_from_slice(&data[bytes_written..bytes_written + chunk]);
+            }
 
             cache.write_block(dev, physical_block, &block_data)?;
 

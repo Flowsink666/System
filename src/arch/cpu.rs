@@ -39,6 +39,12 @@ pub struct VirtualCpu {
     pub context_switches: u64,
 }
 
+impl Default for VirtualCpu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VirtualCpu {
     pub fn new() -> Self {
         Self {

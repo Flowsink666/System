@@ -130,9 +130,18 @@ impl SlabCache {
             self.partial_slabs.push(slab_idx);
         }
 
-        // 如果该 slab 完全空闲且池中存在多个 slab，归还给 Buddy
+        // 如果该 slab 完全空闲且池中存在多个 slab，归还给 Buddy 并彻底清理索引
         if is_empty && self.slabs.len() > 1 {
             let _ = buddy.free_pages(removed_pfn);
+            self.slabs.remove(slab_idx);
+            self.pfn_map.clear();
+            self.partial_slabs.clear();
+            for (idx, slab) in self.slabs.iter().enumerate() {
+                self.pfn_map.insert(slab.pfn, idx);
+                if !slab.is_full() {
+                    self.partial_slabs.push(idx);
+                }
+            }
         }
 
         Ok(())
@@ -146,6 +155,12 @@ pub struct SlabAllocator {
     // 地址句柄映射: alloc_id -> (cache_index, pfn, slot_idx)
     object_map: HashMap<u64, (usize, usize, usize)>,
     next_alloc_id: u64,
+}
+
+impl Default for SlabAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SlabAllocator {

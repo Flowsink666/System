@@ -24,7 +24,7 @@ pub fn run_mm_benchmark() -> MmBenchResult {
 
     let start_buddy_alloc = Instant::now();
     for i in 0..iterations {
-        let order = (i % 4) as usize; // 0, 1, 2, 3 阶
+        let order = i % 4; // 0, 1, 2, 3 阶
         if let Some(pfn) = buddy.allocate_pages(order) {
             allocated_pfns.push(pfn);
         }
