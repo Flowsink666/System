@@ -1,0 +1,160 @@
+
+running 19 tests
+test addresses_above_32_bits_must_not_alias_low_addresses ... FAILED
+test burst_completion_must_release_address_space ... FAILED
+test child_sys_exit_must_wake_waiting_parent ... FAILED
+test closing_child_inherited_fd_must_preserve_parent_fd ... FAILED
+test directory_must_not_accept_regular_file_writes ... FAILED
+test failed_fork_must_roll_back_child_and_pages ... FAILED
+test forked_fd_allocator_must_preserve_inherited_fd ... FAILED
+test initial_cpu_context_must_match_init_pcb ... FAILED
+test invalid_read_buffer_must_not_consume_file_offset ... FAILED
+test page_reuse_must_not_expose_previous_process_data ... FAILED
+test present_flag_must_be_consistent_between_tlb_and_page_table ... FAILED
+test running_task_must_advance_scheduler_min_vruntime ... ok
+test shell_kill_then_reap_must_release_child_memory ... FAILED
+test slab_returned_page_must_not_be_reused_without_buddy_allocation ... FAILED
+test sleep_must_wake_after_requested_ticks ... FAILED
+test terminated_ready_child_must_leave_runqueue ... FAILED
+test unlink_dot_must_not_destroy_directory ... FAILED
+test unlink_open_file_must_keep_handle_readable_until_close ... FAILED
+test zero_length_write_must_write_zero_bytes ... FAILED
+
+failures:
+
+---- addresses_above_32_bits_must_not_alias_low_addresses stdout ----
+
+thread 'addresses_above_32_bits_must_not_alias_low_addresses' (16904) panicked at docs\reviews\system-review-probes.rs:144:5:
+assertion failed: space.translate(0x1_0000_1000).is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- burst_completion_must_release_address_space stdout ----
+
+thread 'burst_completion_must_release_address_space' (23668) panicked at docs\reviews\system-review-probes.rs:74:5:
+assertion `left == right` failed
+  left: 2
+ right: 0
+
+---- child_sys_exit_must_wake_waiting_parent stdout ----
+
+thread 'child_sys_exit_must_wake_waiting_parent' (20020) panicked at docs\reviews\system-review-probes.rs:46:5:
+assertion failed: !matches!(kernel.pm.processes[&1].state, ProcessState::Blocked(_))
+
+---- closing_child_inherited_fd_must_preserve_parent_fd stdout ----
+
+thread 'closing_child_inherited_fd_must_preserve_parent_fd' (14916) panicked at docs\reviews\system-review-probes.rs:104:5:
+assertion failed: kernel.vfs.write(global, b"parent").is_ok()
+
+---- directory_must_not_accept_regular_file_writes stdout ----
+
+thread 'directory_must_not_accept_regular_file_writes' (29148) panicked at docs\reviews\system-review-probes.rs:182:5:
+assertion failed: vfs.write(fd, b"abc").is_err()
+
+---- failed_fork_must_roll_back_child_and_pages stdout ----
+
+thread 'failed_fork_must_roll_back_child_and_pages' (14408) panicked at docs\reviews\system-review-probes.rs:26:5:
+assertion `left == right` failed
+  left: (2, 0)
+ right: (1, 1)
+
+---- forked_fd_allocator_must_preserve_inherited_fd stdout ----
+
+thread 'forked_fd_allocator_must_preserve_inherited_fd' (3000) panicked at docs\reviews\system-review-probes.rs:93:5:
+assertion `left != right` failed
+  left: 3
+ right: 3
+
+---- initial_cpu_context_must_match_init_pcb stdout ----
+
+thread 'initial_cpu_context_must_match_init_pcb' (7644) panicked at docs\reviews\system-review-probes.rs:82:5:
+assertion `left == right` failed
+  left: 40
+ right: 4136
+
+---- invalid_read_buffer_must_not_consume_file_offset stdout ----
+
+thread 'invalid_read_buffer_must_not_consume_file_offset' (22216) panicked at docs\reviews\system-review-probes.rs:115:5:
+assertion `left == right` failed
+  left: 2
+ right: 0
+
+---- page_reuse_must_not_expose_previous_process_data stdout ----
+
+thread 'page_reuse_must_not_expose_previous_process_data' (31248) panicked at docs\reviews\system-review-probes.rs:136:5:
+assertion `left == right` failed
+  left: [83, 69, 67, 82, 69, 84]
+ right: [0, 0, 0, 0, 0, 0]
+
+---- present_flag_must_be_consistent_between_tlb_and_page_table stdout ----
+
+thread 'present_flag_must_be_consistent_between_tlb_and_page_table' (28296) panicked at docs\reviews\system-review-probes.rs:155:5:
+assertion `left == right` failed
+  left: Err("Page fault: page not present")
+ right: Ok(0)
+
+---- shell_kill_then_reap_must_release_child_memory stdout ----
+
+thread 'shell_kill_then_reap_must_release_child_memory' (18300) panicked at docs\reviews\system-review-probes.rs:56:5:
+assertion `left == right` failed
+  left: 4
+ right: 2
+
+---- slab_returned_page_must_not_be_reused_without_buddy_allocation stdout ----
+
+thread 'slab_returned_page_must_not_be_reused_without_buddy_allocation' (17864) panicked at docs\reviews\system-review-probes.rs:18:5:
+assertion `left != right` failed: Buddy and Slab own the same PFN
+  left: 0
+ right: 0
+
+---- sleep_must_wake_after_requested_ticks stdout ----
+
+thread 'sleep_must_wake_after_requested_ticks' (22036) panicked at docs\reviews\system-review-probes.rs:34:5:
+assertion failed: !matches!(kernel.pm.processes[&1].state, ProcessState::Blocked(_))
+
+---- terminated_ready_child_must_leave_runqueue stdout ----
+
+thread 'terminated_ready_child_must_leave_runqueue' (13472) panicked at docs\reviews\system-review-probes.rs:66:5:
+assertion failed: first != Some(child) && second != Some(child)
+
+---- unlink_dot_must_not_destroy_directory stdout ----
+
+thread 'unlink_dot_must_not_destroy_directory' (5216) panicked at docs\reviews\system-review-probes.rs:163:5:
+assertion failed: vfs.stat("/dir").is_ok()
+
+---- unlink_open_file_must_keep_handle_readable_until_close stdout ----
+
+thread 'unlink_open_file_must_keep_handle_readable_until_close' (20868) panicked at docs\reviews\system-review-probes.rs:174:5:
+assertion `left == right` failed
+  left: Err("Inode not found")
+ right: Ok(3)
+
+---- zero_length_write_must_write_zero_bytes stdout ----
+
+thread 'zero_length_write_must_write_zero_bytes' (25716) panicked at docs\reviews\system-review-probes.rs:122:5:
+assertion `left == right` failed
+  left: 21
+ right: 0
+
+
+failures:
+    addresses_above_32_bits_must_not_alias_low_addresses
+    burst_completion_must_release_address_space
+    child_sys_exit_must_wake_waiting_parent
+    closing_child_inherited_fd_must_preserve_parent_fd
+    directory_must_not_accept_regular_file_writes
+    failed_fork_must_roll_back_child_and_pages
+    forked_fd_allocator_must_preserve_inherited_fd
+    initial_cpu_context_must_match_init_pcb
+    invalid_read_buffer_must_not_consume_file_offset
+    page_reuse_must_not_expose_previous_process_data
+    present_flag_must_be_consistent_between_tlb_and_page_table
+    shell_kill_then_reap_must_release_child_memory
+    slab_returned_page_must_not_be_reused_without_buddy_allocation
+    sleep_must_wake_after_requested_ticks
+    terminated_ready_child_must_leave_runqueue
+    unlink_dot_must_not_destroy_directory
+    unlink_open_file_must_keep_handle_readable_until_close
+    zero_length_write_must_write_zero_bytes
+
+test result: FAILED. 1 passed; 18 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
