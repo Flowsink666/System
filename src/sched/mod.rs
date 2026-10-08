@@ -6,7 +6,10 @@ pub mod pcb;
 
 pub use cfs::CfsScheduler;
 pub use ipc::{Pipe, Semaphore};
-pub use pcb::{BlockedReason, FileDescriptorEntry, ProcessControlBlock, ProcessState};
+pub use pcb::{
+    BlockedReason, FileDescriptorEntry, FileDescriptorType, ProcessControlBlock, ProcessState, Vma,
+    VmaBackingFile,
+};
 
 use std::collections::HashMap;
 
@@ -124,6 +127,7 @@ impl ProcessManager {
         child_pcb.next_fd = parent.next_fd;
         child_pcb.vma_list = parent.vma_list.clone();
         child_pcb.context = parent.context;
+        child_pcb.bytecode_mode = parent.bytecode_mode;
 
         let weight = child_pcb.weight;
         let vruntime = child_pcb.vruntime;
@@ -265,6 +269,32 @@ impl ProcessManager {
             return true;
         }
         false
+    }
+
+    /// 唤醒所有等待该管道读取的进程
+    pub fn wake_pipe_readers(&mut self, pipe_id: usize) -> Vec<usize> {
+        let mut awakened = Vec::new();
+        let target_reason = BlockedReason::WaitingPipeRead { pipe_id };
+        let pids: Vec<usize> = self.processes.keys().copied().collect();
+        for pid in pids {
+            if self.wake(pid, target_reason) {
+                awakened.push(pid);
+            }
+        }
+        awakened
+    }
+
+    /// 唤醒所有等待该管道写入的进程
+    pub fn wake_pipe_writers(&mut self, pipe_id: usize) -> Vec<usize> {
+        let mut awakened = Vec::new();
+        let target_reason = BlockedReason::WaitingPipeWrite { pipe_id };
+        let pids: Vec<usize> = self.processes.keys().copied().collect();
+        for pid in pids {
+            if self.wake(pid, target_reason) {
+                awakened.push(pid);
+            }
+        }
+        awakened
     }
 
     /// 等待子进程退出 (Waitpid)

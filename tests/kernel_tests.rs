@@ -74,7 +74,7 @@ fn test_page_table_and_tlb() {
     assert_eq!(space.tlb.hits, 1);
 
     // 解除映射
-    space.unmap_and_free(&mut mm.buddy, va).expect("unmap");
+    space.unmap_and_free(&mut mm, va).expect("unmap");
     assert!(space.translate(va).is_err());
 }
 
@@ -307,7 +307,7 @@ fn test_remapping_and_address_space_destroy() {
     assert_eq!(mm.buddy.stats.free_pages, initial_free - 1);
 
     // 销毁地址空间：所有物理页 100% 归还
-    space.destroy(&mut mm.buddy);
+    space.destroy(&mut mm);
     assert_eq!(mm.buddy.stats.free_pages, initial_free);
 }
 

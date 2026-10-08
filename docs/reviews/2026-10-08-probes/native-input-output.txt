@@ -1,0 +1,2 @@
+after full queue: (668, 380); after one header loss and 30 right-only packets: (668, 140)
+both Shift keys, then release left and type a: a

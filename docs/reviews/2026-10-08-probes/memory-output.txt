@@ -1,0 +1,79 @@
+
+running 8 tests
+test cow_exec_must_not_clear_parent_memory ... FAILED
+test cow_munmap_must_not_recycle_the_parent_page ... FAILED
+test deep_fork_must_preserve_untouched_demand_mapping ... FAILED
+test exec_out_of_memory_must_preserve_original_space ... FAILED
+test executable_eighth_page_must_not_be_replaced_by_data ... FAILED
+test final_burst_tick_halt_must_not_double_terminate_init ... FAILED
+test readonly_file_mmap_must_contain_file_data_and_keep_offset ... FAILED
+test yield_return_must_not_clobber_selected_process_register ... FAILED
+
+failures:
+
+---- cow_exec_must_not_clear_parent_memory stdout ----
+
+thread 'cow_exec_must_not_clear_parent_memory' (17168) panicked at target/review-20261008-agent-memory/probes.rs:26:5:
+assertion `left == right` failed
+  left: [0, 0, 0, 0, 0, 0]
+ right: [83, 69, 67, 82, 69, 84]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- cow_munmap_must_not_recycle_the_parent_page stdout ----
+
+thread 'cow_munmap_must_not_recycle_the_parent_page' (5364) panicked at target/review-20261008-agent-memory/probes.rs:14:5:
+assertion `left == right` failed
+  left: [78, 69, 87, 33]
+ right: [79, 76, 68, 33]
+
+---- deep_fork_must_preserve_untouched_demand_mapping stdout ----
+
+thread 'deep_fork_must_preserve_untouched_demand_mapping' (27912) panicked at target/review-20261008-agent-memory/probes.rs:92:97:
+called `Result::unwrap()` on an `Err` value: "Page fault: virtual address not mapped"
+
+---- exec_out_of_memory_must_preserve_original_space stdout ----
+
+thread 'exec_out_of_memory_must_preserve_original_space' (6564) panicked at target/review-20261008-agent-memory/probes.rs:35:5:
+assertion `left == right` failed: failed exec consumes new pages and destroys old pages
+  left: 0
+ right: 2
+
+---- executable_eighth_page_must_not_be_replaced_by_data stdout ----
+
+thread 'executable_eighth_page_must_not_be_replaced_by_data' (8580) panicked at target/review-20261008-agent-memory/probes.rs:48:5:
+assertion `left == right` failed
+  left: [0, 0, 0, 0]
+ right: [171, 171, 171, 171]
+
+---- final_burst_tick_halt_must_not_double_terminate_init stdout ----
+
+thread 'final_burst_tick_halt_must_not_double_terminate_init' (9892) panicked at src\kernel.rs:534:18:
+Scheduled process must exist: "Process not found"
+
+---- readonly_file_mmap_must_contain_file_data_and_keep_offset stdout ----
+
+thread 'readonly_file_mmap_must_contain_file_data_and_keep_offset' (20124) panicked at target/review-20261008-agent-memory/probes.rs:83:5:
+assertion `left == right` failed
+  left: [0, 0, 0, 0, 0, 0]
+ right: [83, 79, 85, 82, 67, 69]
+
+---- yield_return_must_not_clobber_selected_process_register stdout ----
+
+thread 'yield_return_must_not_clobber_selected_process_register' (11268) panicked at target/review-20261008-agent-memory/probes.rs:62:5:
+assertion `left == right` failed: SYS_YIELD return overwrites the new task's RAX
+  left: 0
+ right: 123
+
+
+failures:
+    cow_exec_must_not_clear_parent_memory
+    cow_munmap_must_not_recycle_the_parent_page
+    deep_fork_must_preserve_untouched_demand_mapping
+    exec_out_of_memory_must_preserve_original_space
+    executable_eighth_page_must_not_be_replaced_by_data
+    final_burst_tick_halt_must_not_double_terminate_init
+    readonly_file_mmap_must_contain_file_data_and_keep_offset
+    yield_return_must_not_clobber_selected_process_register
+
+test result: FAILED. 0 passed; 8 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

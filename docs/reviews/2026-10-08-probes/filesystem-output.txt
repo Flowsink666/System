@@ -1,0 +1,6 @@
+metadata_overlap: last_file_blocks=[38, 37, 36, 35, 34, 33]
+metadata_overlap: commit=Ok, read_bytes=3072, preserved_Q_bytes=2048 (expected 3072)
+directory_truncation: commit=Ok, before=9, after=8 (expected 9)
+pipe_bad_read: result=Err("Page fault: virtual address not mapped"), remaining=0 (expected 8), writer_state=Blocked(WaitingPipeWrite { pipe_id: 1 })
+stdin_bad_read: result=Err("Page fault: virtual address not mapped"), remaining=0 (expected 5)
+pipe_failure_rollback: result=Err("Page fault: virtual address not mapped"), pipes=1->2, fds=5->7 (expected unchanged)

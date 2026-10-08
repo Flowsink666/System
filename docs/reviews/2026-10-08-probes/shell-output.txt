@@ -1,0 +1,26 @@
+
+running 2 tests
+test failed_shell_exec_must_not_leave_a_runnable_process ... exec 执行失败: File not found
+process_count before=1, after=2
+
+thread 'failed_shell_exec_must_not_leave_a_runnable_process' (18440) panicked at target/review-20261008-root/shell-probes.rs:46:5:
+assertion `left == right` failed: failed exec must roll back its newly spawned process
+  left: 2
+ right: 1
+FAILED
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test shell_load_must_not_alias_an_existing_process_file_descriptor ... 已成功载入镜像并重新挂载文件系统: target/review-20261008-root/load-probe.img
+old_vfs_fd=13, result=Ok(11), observed=Ok("replacement")
+
+thread 'shell_load_must_not_alias_an_existing_process_file_descriptor' (5208) panicked at target/review-20261008-root/shell-probes.rs:36:5:
+old FD must never read an unrelated replacement file
+FAILED
+
+failures:
+
+failures:
+    failed_shell_exec_must_not_leave_a_runnable_process
+    shell_load_must_not_alias_an_existing_process_file_descriptor
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

@@ -1,0 +1,38 @@
+name: Mini-OS checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  simulator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo test --all-targets --offline
+      - run: cargo clippy --all-targets --offline -- -D warnings
+
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: x86_64-unknown-uefi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cargo fmt --manifest-path baremetal/Cargo.toml --all -- --check
+      - run: cargo test --manifest-path baremetal/Cargo.toml --lib --offline
+      - run: cargo clippy --manifest-path baremetal/Cargo.toml --target x86_64-unknown-uefi --release --offline -- -D warnings
+      - run: cargo build --manifest-path baremetal/Cargo.toml --target x86_64-unknown-uefi --release --offline
+      - run: node --test baremetal/scripts/test-serial-markers.js
+      - run: node baremetal/scripts/make-image.js baremetal/target/x86_64-unknown-uefi/release/mini_os_native.efi target/mini-os.img

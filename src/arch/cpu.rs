@@ -20,6 +20,8 @@ pub struct CpuContext {
     pub rflags: u64,   // 标志寄存器
 }
 
+use super::instruction::Register;
+
 impl CpuContext {
     pub fn new(entry_point: u64, stack_top: u64) -> Self {
         Self {
@@ -28,6 +30,34 @@ impl CpuContext {
             rbp: stack_top,
             rflags: 0x202, // 默认开启中断标志 IF (Interrupt Flag)
             ..Default::default()
+        }
+    }
+
+    pub fn get_reg(&self, reg: Register) -> u64 {
+        match reg {
+            Register::Rax => self.rax,
+            Register::Rbx => self.rbx,
+            Register::Rcx => self.rcx,
+            Register::Rdx => self.rdx,
+            Register::Rsi => self.rsi,
+            Register::Rdi => self.rdi,
+            Register::Rbp => self.rbp,
+            Register::Rsp => self.rsp,
+            Register::Rip => self.rip,
+        }
+    }
+
+    pub fn set_reg(&mut self, reg: Register, val: u64) {
+        match reg {
+            Register::Rax => self.rax = val,
+            Register::Rbx => self.rbx = val,
+            Register::Rcx => self.rcx = val,
+            Register::Rdx => self.rdx = val,
+            Register::Rsi => self.rsi = val,
+            Register::Rdi => self.rdi = val,
+            Register::Rbp => self.rbp = val,
+            Register::Rsp => self.rsp = val,
+            Register::Rip => self.rip = val,
         }
     }
 }

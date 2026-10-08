@@ -1,5 +1,5 @@
 //! 目录项与哈希索引 (Directory & Dentry Indexing)
-//! 
+//!
 //! 高性能特性：
 //! 1. 基于哈希表结构提供 O(1) 文件名检索，避免传统线性目录扫描
 //! 2. 支持树状路径分词与层级快速寻址
@@ -8,6 +8,8 @@
 use super::inode::InodeType;
 use std::collections::HashMap;
 
+pub const MAX_NAME_BYTES: usize = 58;
+
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub name: String,
@@ -15,6 +17,7 @@ pub struct DirEntry {
     pub inode_type: InodeType,
 }
 
+#[derive(Clone)]
 pub struct Directory {
     pub inode_id: usize,
     pub entries: HashMap<String, DirEntry>,
@@ -50,7 +53,15 @@ impl Directory {
     }
 
     /// 添加新项
-    pub fn add_entry(&mut self, name: &str, inode_id: usize, inode_type: InodeType) -> Result<(), &'static str> {
+    pub fn add_entry(
+        &mut self,
+        name: &str,
+        inode_id: usize,
+        inode_type: InodeType,
+    ) -> Result<(), &'static str> {
+        if name.is_empty() || name.contains('/') || name.len() > MAX_NAME_BYTES {
+            return Err("Invalid directory entry name (maximum 58 bytes)");
+        }
         if self.entries.contains_key(name) {
             return Err("File or directory already exists");
         }

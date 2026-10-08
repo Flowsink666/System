@@ -194,7 +194,7 @@ fn page_reuse_must_not_expose_previous_process_data() {
     let mut old = AddressSpace::new(8);
     old.allocate_and_map(&mut mm, 0x1000, 7).unwrap();
     mm.write_virtual(&mut old, 0x1000, b"SECRET").unwrap();
-    old.destroy(&mut mm.buddy);
+    old.destroy(&mut mm);
     let mut fresh = AddressSpace::new(8);
     fresh.allocate_and_map(&mut mm, 0x1000, 7).unwrap();
     let mut buf = [0; 6];

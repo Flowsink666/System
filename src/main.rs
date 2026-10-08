@@ -22,20 +22,29 @@ fn run_kernel_demo() {
     // 2. 内存分配验证
     println!("\n[2/5] 验证物理页伙伴系统与 Slab 对象分配...");
     let pfn = kernel.mm.buddy.allocate_pages(2).unwrap();
-    println!("  - 成功向 Buddy 申请 Order 2 (4 页 = 16KB) 连续物理内存，PFN = {}", pfn);
+    println!(
+        "  - 成功向 Buddy 申请 Order 2 (4 页 = 16KB) 连续物理内存，PFN = {}",
+        pfn
+    );
     kernel.mm.buddy.free_pages(pfn).unwrap();
     println!("  - 成功释放该页块，伙伴系统自动执行位运算合并");
 
     let slab_h1 = kernel.mm.slab.kmalloc(&mut kernel.mm.buddy, 64).unwrap();
     let slab_h2 = kernel.mm.slab.kmalloc(&mut kernel.mm.buddy, 64).unwrap();
-    println!("  - 成功从 kmalloc-64 Slab 池分配两个 64B 结构 (句柄: {}, {})", slab_h1, slab_h2);
+    println!(
+        "  - 成功从 kmalloc-64 Slab 池分配两个 64B 结构 (句柄: {}, {})",
+        slab_h1, slab_h2
+    );
     kernel.mm.slab.kfree(&mut kernel.mm.buddy, slab_h1).unwrap();
     kernel.mm.slab.kfree(&mut kernel.mm.buddy, slab_h2).unwrap();
     println!("  - 成功归还 Slab 对象，零外部碎片化");
 
     // 3. 文件系统读写与页缓存验证
     println!("\n[3/5] 验证文件系统创建、写入、读取与页缓存...");
-    let fd = kernel.vfs.open("/home/test.txt", fs::O_CREAT | fs::O_RDWR).unwrap();
+    let fd = kernel
+        .vfs
+        .open("/home/test.txt", fs::O_CREAT | fs::O_RDWR)
+        .unwrap();
     let sample_text = b"Hello Mini-OS Kernel! Buffer Cache provides extreme I/O speed.\n";
     let _ = kernel.vfs.write(fd, sample_text);
     let _ = kernel.vfs.close(fd);
@@ -44,15 +53,24 @@ fn run_kernel_demo() {
     let mut read_buf = vec![0u8; 128];
     let n = kernel.vfs.read(fd_read, &mut read_buf).unwrap();
     let _ = kernel.vfs.close(fd_read);
-    println!("  - 读取 /home/test.txt 内容: {}", String::from_utf8_lossy(&read_buf[..n]).trim());
-    println!("  - Buffer Cache 当前命中率: {:.2}%", kernel.vfs.cache.hit_rate());
+    println!(
+        "  - 读取 /home/test.txt 内容: {}",
+        String::from_utf8_lossy(&read_buf[..n]).trim()
+    );
+    println!(
+        "  - Buffer Cache 当前命中率: {:.2}%",
+        kernel.vfs.cache.hit_rate()
+    );
 
     // 4. 多进程并发与 CFS 调度模拟
     println!("\n[4/5] 验证多进程并发创建与 CFS 完全公平调度...");
     let p1 = kernel.pm.spawn("compute_task_A", -5, 60);
-    let p2 = kernel.pm.spawn("io_worker_B",      0, 60);
+    let p2 = kernel.pm.spawn("io_worker_B", 0, 60);
     let p3 = kernel.pm.spawn("background_task", 5, 60);
-    println!("  - 创建进程 P1 (PID {}, nice=-5), P2 (PID {}, nice=0), P3 (PID {}, nice=5)", p1, p2, p3);
+    println!(
+        "  - 创建进程 P1 (PID {}, nice=-5), P2 (PID {}, nice=0), P3 (PID {}, nice=5)",
+        p1, p2, p3
+    );
 
     println!("  - 执行 15 个时钟周期的调度推进:");
     let logs = kernel.step(15);

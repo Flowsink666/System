@@ -1,5 +1,5 @@
 //! 虚拟文件系统接口与统一抽象 (Virtual File System - VFS)
-//! 
+//!
 //! 高性能特性：
 //! 1. 统一管理常规文件、目录、设备、管道等文件系统对象
 //! 2. 结合 BufferCache 实现端到端毫秒/微秒级低延迟文件读写
@@ -36,6 +36,7 @@ pub struct VfsOpenFile {
     pub ref_count: usize,
 }
 
+#[derive(Clone)]
 pub struct VirtualFileSystem {
     pub dev: VirtualBlockDevice,
     pub cache: BufferCache,
@@ -44,8 +45,8 @@ pub struct VirtualFileSystem {
     pub free_blocks: Vec<usize>,
     pub open_files: HashMap<usize, VfsOpenFile>,
     pub unlinked_inodes: std::collections::HashSet<usize>,
-    next_inode_id: usize,
-    next_fd: usize,
+    pub next_inode_id: usize,
+    pub next_fd: usize,
     pub root_inode_id: usize,
 }
 
@@ -53,7 +54,14 @@ impl VirtualFileSystem {
     pub fn new(total_blocks: usize, cache_capacity: usize) -> Self {
         let dev = VirtualBlockDevice::new(total_blocks);
         let cache = BufferCache::new(cache_capacity);
-        let mut free_blocks: Vec<usize> = (0..total_blocks).collect();
+        // Tiny devices remain usable for in-memory simulations; persistence requires
+        // the full disk layout. Devices that fit that layout never allocate metadata.
+        let data_start = if total_blocks > super::disk::DATA_BLOCKS_START {
+            super::disk::DATA_BLOCKS_START
+        } else {
+            1
+        };
+        let free_blocks: Vec<usize> = (data_start..total_blocks).collect();
 
         // 根目录初始化 (inode 0)
         let root_inode_id = 0;
@@ -65,9 +73,6 @@ impl VirtualFileSystem {
 
         inodes.insert(root_inode_id, root_inode);
         directories.insert(root_inode_id, root_dir);
-
-        // 保留块 0 作为超级块预留
-        free_blocks.retain(|&b| b != 0);
 
         Self {
             dev,
@@ -90,10 +95,7 @@ impl VirtualFileSystem {
             return Ok(self.root_inode_id);
         }
 
-        let parts: Vec<&str> = trimmed
-            .split('/')
-            .filter(|p| !p.is_empty())
-            .collect();
+        let parts: Vec<&str> = trimmed.split('/').filter(|p| !p.is_empty()).collect();
 
         let mut curr_inode = self.root_inode_id;
 
@@ -134,6 +136,9 @@ impl VirtualFileSystem {
     /// 创建新目录
     pub fn mkdir(&mut self, path: &str) -> Result<usize, &'static str> {
         let (parent_id, name) = self.resolve_parent_and_name(path)?;
+        if name.is_empty() || name.contains('/') || name.len() > super::dir::MAX_NAME_BYTES {
+            return Err("Invalid directory entry name (maximum 58 bytes)");
+        }
 
         // 检查父目录是否存在同名项
         if let Some(parent_dir) = self.directories.get(&parent_id) {
@@ -144,8 +149,7 @@ impl VirtualFileSystem {
             return Err("Parent is not a directory");
         }
 
-        let new_inode_id = self.next_inode_id;
-        self.next_inode_id += 1;
+        let new_inode_id = self.allocate_inode_id()?;
 
         let new_inode = Inode::new(new_inode_id, InodeType::Directory, 0o755);
         let new_dir = Directory::new(new_inode_id, parent_id);
@@ -157,6 +161,21 @@ impl VirtualFileSystem {
         parent_dir.add_entry(name, new_inode_id, InodeType::Directory)?;
 
         Ok(new_inode_id)
+    }
+
+    fn allocate_inode_id(&mut self) -> Result<usize, &'static str> {
+        if self.dev.num_blocks > super::disk::DATA_BLOCKS_START {
+            let id = (self.next_inode_id..super::disk::DISK_INODE_COUNT)
+                .chain(1..self.next_inode_id.min(super::disk::DISK_INODE_COUNT))
+                .find(|id| !self.inodes.contains_key(id))
+                .ok_or("Filesystem inode table is full (256 inode limit)")?;
+            self.next_inode_id = id + 1;
+            Ok(id)
+        } else {
+            let id = self.next_inode_id;
+            self.next_inode_id = id.checked_add(1).ok_or("Inode ID overflow")?;
+            Ok(id)
+        }
     }
 
     /// 打开或创建文件
@@ -178,19 +197,28 @@ impl VirtualFileSystem {
                     let (parent_id, name) = self.resolve_parent_and_name(path)?;
                     let parent_dir = self
                         .directories
-                        .get_mut(&parent_id)
+                        .get(&parent_id)
                         .ok_or("Parent directory not found")?;
 
                     if parent_dir.lookup(name).is_some() {
                         return Err("File already exists");
                     }
 
-                    let new_inode_id = self.next_inode_id;
-                    self.next_inode_id += 1;
+                    if name.is_empty()
+                        || name.contains('/')
+                        || name.len() > super::dir::MAX_NAME_BYTES
+                    {
+                        return Err("Invalid directory entry name (maximum 58 bytes)");
+                    }
+                    let new_inode_id = self.allocate_inode_id()?;
 
                     let new_inode = Inode::new(new_inode_id, InodeType::Regular, 0o644);
                     self.inodes.insert(new_inode_id, new_inode);
-                    parent_dir.add_entry(name, new_inode_id, InodeType::Regular)?;
+                    self.directories.get_mut(&parent_id).unwrap().add_entry(
+                        name,
+                        new_inode_id,
+                        InodeType::Regular,
+                    )?;
 
                     new_inode_id
                 } else {
@@ -200,7 +228,11 @@ impl VirtualFileSystem {
         };
 
         let inode = self.inodes.get(&inode_id).unwrap();
-        let offset = if (flags & O_APPEND) != 0 { inode.size } else { 0 };
+        let offset = if (flags & O_APPEND) != 0 {
+            inode.size
+        } else {
+            0
+        };
 
         let fd = self.next_fd;
         self.next_fd += 1;
@@ -219,14 +251,20 @@ impl VirtualFileSystem {
 
     /// 复制全局打开文件描述符引用 (fork 或 dup)
     pub fn dup_fd(&mut self, fd: usize) -> Result<(), &'static str> {
-        let file = self.open_files.get_mut(&fd).ok_or("Invalid file descriptor")?;
+        let file = self
+            .open_files
+            .get_mut(&fd)
+            .ok_or("Invalid file descriptor")?;
         file.ref_count += 1;
         Ok(())
     }
 
     /// 读取文件 (受读模式权限检查约束)
     pub fn read(&mut self, fd: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
-        let file = self.open_files.get_mut(&fd).ok_or("Invalid file descriptor")?;
+        let file = self
+            .open_files
+            .get_mut(&fd)
+            .ok_or("Invalid file descriptor")?;
         // 模式校验: O_WRONLY 不能读取
         if (file.flags & O_WRONLY) != 0 && (file.flags & O_RDWR) == 0 {
             return Err("File not open for reading");
@@ -244,7 +282,10 @@ impl VirtualFileSystem {
 
     /// 写入文件 (受写模式权限检查与 O_APPEND 动态重定位约束)
     pub fn write(&mut self, fd: usize, data: &[u8]) -> Result<usize, &'static str> {
-        let file = self.open_files.get_mut(&fd).ok_or("Invalid file descriptor")?;
+        let file = self
+            .open_files
+            .get_mut(&fd)
+            .ok_or("Invalid file descriptor")?;
         // 模式校验: O_RDONLY (0) 无法写入
         if (file.flags & (O_WRONLY | O_RDWR)) == 0 {
             return Err("File not open for writing (read-only mode)");
@@ -279,7 +320,10 @@ impl VirtualFileSystem {
 
     /// 设置文件指针游标
     pub fn seek(&mut self, fd: usize, offset: usize) -> Result<usize, &'static str> {
-        let file = self.open_files.get_mut(&fd).ok_or("Invalid file descriptor")?;
+        let file = self
+            .open_files
+            .get_mut(&fd)
+            .ok_or("Invalid file descriptor")?;
         file.offset = offset;
         Ok(file.offset)
     }
@@ -287,7 +331,10 @@ impl VirtualFileSystem {
     /// 关闭文件
     pub fn close(&mut self, fd: usize) -> Result<(), &'static str> {
         let (inode_id, should_remove_fd) = {
-            let file = self.open_files.get_mut(&fd).ok_or("Invalid file descriptor")?;
+            let file = self
+                .open_files
+                .get_mut(&fd)
+                .ok_or("Invalid file descriptor")?;
             if file.ref_count > 1 {
                 file.ref_count -= 1;
                 (file.inode_id, false)
@@ -332,7 +379,10 @@ impl VirtualFileSystem {
 
         // 1. 先行校验：若为目录必须为空 (除 . 和 .. 外无文件)，若非空直接退出，绝不破坏父目录
         if entry.inode_type == InodeType::Directory {
-            let dir = self.directories.get(&entry.inode_id).ok_or("Directory not found")?;
+            let dir = self
+                .directories
+                .get(&entry.inode_id)
+                .ok_or("Directory not found")?;
             if dir.entries.len() > 2 {
                 return Err("Directory not empty");
             }
@@ -350,7 +400,10 @@ impl VirtualFileSystem {
 
         // 3. 释放 Inode 与数据块
         // 若当前有打开句柄正在引用此 Inode，延迟到 close 时彻底销毁 (符合 POSIX 规范)
-        let is_open = self.open_files.values().any(|f| f.inode_id == entry.inode_id);
+        let is_open = self
+            .open_files
+            .values()
+            .any(|f| f.inode_id == entry.inode_id);
         if is_open {
             self.unlinked_inodes.insert(entry.inode_id);
         } else if let Some(mut inode) = self.inodes.remove(&entry.inode_id) {
@@ -410,5 +463,10 @@ impl VirtualFileSystem {
     /// 刷新所有缓冲缓存回物理块设备
     pub fn sync(&mut self) -> Result<(), &'static str> {
         self.cache.sync(&mut self.dev)
+    }
+
+    /// 将当前 VFS 的所有 Inode、目录树与分配位图完整持久化提交到底层块设备
+    pub fn commit_to_disk(&mut self) -> Result<(), &'static str> {
+        super::disk::commit_vfs_to_disk(self)
     }
 }

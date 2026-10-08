@@ -1,7 +1,9 @@
-//! 内存子系统性能基准测试 (Memory Management Benchmarks)
+//! Allocation/free throughput, measured on fresh allocators in each sample.
 
+use super::{collect_samples, median, median_f64};
 use crate::mm::{BuddyAllocator, SlabAllocator, PAGE_SIZE};
-use std::time::Instant;
+use std::hint::black_box;
+use std::time::{Duration, Instant};
 
 pub struct MmBenchResult {
     pub buddy_alloc_time_us: u128,
@@ -13,94 +15,95 @@ pub struct MmBenchResult {
     pub memory_saved_ratio: f64,
 }
 
+const TOTAL_PAGES: usize = 65_536;
+const BUDDY_ITERATIONS: usize = 10_000;
+const SLAB_ITERATIONS: usize = 5_000;
+const OBJECT_SIZE: usize = 64;
+
+struct AllocationSample {
+    allocate: Duration,
+    free: Duration,
+    completed_ops: usize,
+    peak_pages: usize,
+}
+
+impl AllocationSample {
+    fn ops_per_sec(&self) -> f64 {
+        self.completed_ops as f64 / (self.allocate + self.free).as_secs_f64()
+    }
+}
+
+fn buddy_sample() -> AllocationSample {
+    let mut buddy = BuddyAllocator::new(TOTAL_PAGES);
+    let mut pfns = Vec::with_capacity(BUDDY_ITERATIONS);
+    let start = Instant::now();
+    for index in 0..BUDDY_ITERATIONS {
+        pfns.push(black_box(buddy.allocate_pages(black_box(index % 4)).expect("buddy benchmark allocation failed")));
+    }
+    let allocate = start.elapsed();
+    let peak_pages = buddy.stats.allocated_pages;
+    let start = Instant::now();
+    for pfn in pfns {
+        buddy.free_pages(black_box(pfn)).expect("buddy benchmark free failed");
+    }
+    let free = start.elapsed();
+    assert_eq!(buddy.stats.free_pages, TOTAL_PAGES, "buddy benchmark leaked pages");
+    black_box(buddy.stats);
+    AllocationSample { allocate, free, completed_ops: BUDDY_ITERATIONS * 2, peak_pages }
+}
+
+fn slab_sample() -> AllocationSample {
+    let mut buddy = BuddyAllocator::new(TOTAL_PAGES);
+    let mut slab = SlabAllocator::new();
+    let mut handles = Vec::with_capacity(SLAB_ITERATIONS);
+    let start = Instant::now();
+    for _ in 0..SLAB_ITERATIONS {
+        handles.push(black_box(slab.kmalloc(&mut buddy, black_box(OBJECT_SIZE)).expect("slab benchmark allocation failed")));
+    }
+    let allocate = start.elapsed();
+    let peak_pages = buddy.stats.allocated_pages;
+    let start = Instant::now();
+    for handle in handles {
+        slab.kfree(&mut buddy, black_box(handle)).expect("slab benchmark free failed");
+    }
+    let free = start.elapsed();
+    assert!(slab.get_cache_stats().iter().all(|stats| stats.2 == 0), "slab benchmark left live objects");
+    black_box(slab.get_cache_stats());
+    AllocationSample { allocate, free, completed_ops: SLAB_ITERATIONS * 2, peak_pages }
+}
+
 pub fn run_mm_benchmark() -> MmBenchResult {
     println!("\n========== [1/3] 内存子系统性能基准测试 ==========");
-    
-    // 1. Buddy 伙伴系统分配与回收基准测试 (10,000 次操作)
-    let total_pages = 32768; // 128MB 虚拟物理内存
-    let mut buddy = BuddyAllocator::new(total_pages);
-    let iterations = 10_000;
-    let mut allocated_pfns = Vec::with_capacity(iterations);
-
-    let start_buddy_alloc = Instant::now();
-    for i in 0..iterations {
-        let order = i % 4; // 0, 1, 2, 3 阶
-        if let Some(pfn) = buddy.allocate_pages(order) {
-            allocated_pfns.push(pfn);
-        }
-    }
-    let buddy_alloc_time = start_buddy_alloc.elapsed();
-    let success_allocs = allocated_pfns.len();
-
-    let start_buddy_free = Instant::now();
-    let mut success_frees = 0;
-    for pfn in allocated_pfns.drain(..) {
-        if buddy.free_pages(pfn).is_ok() {
-            success_frees += 1;
-        }
-    }
-    let buddy_free_time = start_buddy_free.elapsed();
-
-    let total_buddy_time = buddy_alloc_time + buddy_free_time;
-    let total_successful_ops = success_allocs + success_frees;
-    let buddy_ops_per_sec = total_successful_ops as f64 / total_buddy_time.as_secs_f64();
+    let buddy = collect_samples(buddy_sample);
+    let slab = collect_samples(slab_sample);
+    let buddy_allocate = median(buddy.iter().map(|sample| sample.allocate).collect());
+    let buddy_free = median(buddy.iter().map(|sample| sample.free).collect());
+    let buddy_ops_per_sec = median_f64(buddy.iter().map(AllocationSample::ops_per_sec).collect());
+    let slab_allocate = median(slab.iter().map(|sample| sample.allocate).collect());
+    let slab_free = median(slab.iter().map(|sample| sample.free).collect());
+    let slab_ops_per_sec = median_f64(slab.iter().map(AllocationSample::ops_per_sec).collect());
+    let slab_pages = median(slab.iter().map(|sample| sample.peak_pages).collect());
+    let naive_bytes = SLAB_ITERATIONS * PAGE_SIZE;
+    let slab_bytes = slab_pages * PAGE_SIZE;
+    let memory_saved_ratio = (1.0 - slab_bytes as f64 / naive_bytes as f64) * 100.0;
 
     println!("  [Buddy Allocator]");
-    println!("    - 测试规模: {} 次申请尝试, 成功分配 {} 块, 成功释放 {} 块", iterations, success_allocs, success_frees);
-    println!("    - 纯分配耗时: {:.2?} (平均 {:.2} ns/次)", buddy_alloc_time, (buddy_alloc_time.as_nanos() as f64) / iterations as f64);
-    println!("    - 纯释放耗时: {:.2?} (平均 {:.2} ns/次)", buddy_free_time, (buddy_free_time.as_nanos() as f64) / success_frees.max(1) as f64);
-    println!("    - 伙伴合并次数: {}, 拆分次数: {}", buddy.stats.merges_count, buddy.stats.splits_count);
-    println!("    - 有效吞吐速率: {:.0} ops/sec (基于实际完成的 {} 次操作)", buddy_ops_per_sec, total_successful_ops);
-
-    // 2. Slab 高速缓存分配器对比测试 (5,000 次 64 字节小对象)
-    let mut slab = SlabAllocator::new();
-    let slab_iterations = 5_000;
-    let mut slab_handles = Vec::with_capacity(slab_iterations);
-
-    let start_slab_alloc = Instant::now();
-    for _ in 0..slab_iterations {
-        if let Some(h) = slab.kmalloc(&mut buddy, 64) {
-            slab_handles.push(h);
-        }
-    }
-    let slab_alloc_time = start_slab_alloc.elapsed();
-    let slab_success_allocs = slab_handles.len();
-
-    let start_slab_free = Instant::now();
-    let mut slab_success_frees = 0;
-    for h in slab_handles.drain(..) {
-        if slab.kfree(&mut buddy, h).is_ok() {
-            slab_success_frees += 1;
-        }
-    }
-    let slab_free_time = start_slab_free.elapsed();
-
-    let total_slab_time = slab_alloc_time + slab_free_time;
-    let total_slab_ops = slab_success_allocs + slab_success_frees;
-    let slab_ops_per_sec = total_slab_ops as f64 / total_slab_time.as_secs_f64();
-
-    let naive_memory_bytes = slab_iterations * PAGE_SIZE;
-    let slab_memory_bytes = ((slab_iterations as f64 / (PAGE_SIZE / 64) as f64).ceil() as usize) * PAGE_SIZE;
-    let saved_ratio = (1.0 - (slab_memory_bytes as f64 / naive_memory_bytes as f64)) * 100.0;
-
-    println!("\n  [Slab Object Cache]");
-    println!("    - 测试规模: {} 次 64-byte 小对象分配与回收 (O(1) 索引池)", slab_iterations);
-    println!("    - 纯分配耗时: {:.2?} (平均 {:.2} ns/次)", slab_alloc_time, (slab_alloc_time.as_nanos() as f64) / slab_iterations as f64);
-    println!("    - 纯释放耗时: {:.2?} (平均 {:.2} ns/次)", slab_free_time, (slab_free_time.as_nanos() as f64) / slab_success_frees.max(1) as f64);
-    println!("    - 吞吐速率: {:.0} ops/sec", slab_ops_per_sec);
-    println!("    - 内存节约对比: 传统页分配需 {:.2} MB，Slab 仅需 {:.2} KB (节约 {:.2}% 物理内存)", 
-        naive_memory_bytes as f64 / 1024.0 / 1024.0,
-        slab_memory_bytes as f64 / 1024.0,
-        saved_ratio
-    );
+    println!("    - 每轮 {BUDDY_ITERATIONS} 次分配与 {BUDDY_ITERATIONS} 次回收，阶数 0..3；每轮校验页数恢复。");
+    println!("    - 分配耗时中位数: {buddy_allocate:.2?}，回收耗时中位数: {buddy_free:.2?}");
+    println!("    - 有效吞吐中位数: {buddy_ops_per_sec:.0} ops/sec");
+    println!("  [Slab Object Cache]");
+    println!("    - 每轮 {SLAB_ITERATIONS} 个 {OBJECT_SIZE}B 对象分配与回收；每轮校验无存活对象。");
+    println!("    - 分配耗时中位数: {slab_allocate:.2?}，回收耗时中位数: {slab_free:.2?}");
+    println!("    - 有效吞吐中位数: {slab_ops_per_sec:.0} ops/sec");
+    println!("    - 按对象各占一页比较: {:.2}MB → {:.2}KB 模拟物理页，节约 {memory_saved_ratio:.2}%（不含宿主机元数据）。", naive_bytes as f64 / 1024.0 / 1024.0, slab_bytes as f64 / 1024.0);
 
     MmBenchResult {
-        buddy_alloc_time_us: buddy_alloc_time.as_micros(),
-        buddy_free_time_us: buddy_free_time.as_micros(),
+        buddy_alloc_time_us: buddy_allocate.as_micros(),
+        buddy_free_time_us: buddy_free.as_micros(),
         buddy_ops_per_sec,
-        slab_alloc_time_us: slab_alloc_time.as_micros(),
-        slab_free_time_us: slab_free_time.as_micros(),
+        slab_alloc_time_us: slab_allocate.as_micros(),
+        slab_free_time_us: slab_free.as_micros(),
         slab_ops_per_sec,
-        memory_saved_ratio: saved_ratio,
+        memory_saved_ratio,
     }
 }

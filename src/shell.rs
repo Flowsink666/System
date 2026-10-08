@@ -2,7 +2,7 @@
 
 use crate::benchmark::run_all_benchmarks;
 use crate::fs::{InodeType, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC};
-use crate::kernel::Kernel;
+use crate::kernel::{Kernel, KernelEvent};
 use std::io::{self, BufRead, Write};
 
 pub struct KernelShell<'a> {
@@ -96,6 +96,7 @@ impl<'a> KernelShell<'a> {
             "status" => self.cmd_status(),
             "ps" | "top" => self.cmd_ps(),
             "spawn" => self.cmd_spawn(args),
+            "exec" => self.cmd_exec(args),
             "kill" => self.cmd_kill(args),
             "step" => self.cmd_step(args),
             "run" => self.cmd_run(args),
@@ -109,6 +110,8 @@ impl<'a> KernelShell<'a> {
             "mkdir" => self.cmd_mkdir(args),
             "rm" => self.cmd_rm(args),
             "sync" => self.cmd_sync(),
+            "save" => self.cmd_save(args),
+            "load" => self.cmd_load(args),
             "bench" => run_all_benchmarks(),
             "clear" => {
                 print!("\x1B[2J\x1B[1;1H");
@@ -127,6 +130,7 @@ impl<'a> KernelShell<'a> {
         println!("  status                - 查看内核整体运行状态、CPU 周期与内存/缓存概况");
         println!("  ps / top              - 查看系统进程表 (PID, Nice, 状态, 虚拟运行时间等)");
         println!("  spawn <name> [nice] [burst] - 创建新进程 (默认 nice=0, burst=100)");
+        println!("  exec <path>           - 装载并执行指定 VFS 二进制可执行文件 (例如 exec /bin/hello)");
         println!("  kill <pid>            - 终止指定 PID 进程");
         println!("  step [ticks]          - 单步/多步推动时钟周期并执行 CFS 调度 (默认 1)");
         println!("  run <ticks>           - 连续推进指定周期数 (例如 run 50)");
@@ -139,7 +143,9 @@ impl<'a> KernelShell<'a> {
         println!("  write <path> <text>   - 向文件写入文本内容");
         println!("  mkdir <path>          - 创建新目录");
         println!("  rm <path>             - 删除文件或空目录");
-        println!("  sync                  - 刷新所有页缓存脏块到物理块存储");
+        println!("  sync                  - 刷新所有页缓存与元数据提交持久化到磁盘介质");
+        println!("  save <file>           - 提交文件系统并导出磁盘镜像文件到宿主机 (如 save disk.img)");
+        println!("  load <file>           - 从宿主机磁盘镜像文件挂载并恢复文件系统 (如 load disk.img)");
         println!("  bench                 - 运行全套性能基准测试 (内存、调度、文件 I/O)");
         println!("  clear                 - 清除终端屏幕");
         println!("  exit / quit           - 退出内核\n");
@@ -219,21 +225,29 @@ impl<'a> KernelShell<'a> {
 
     fn cmd_run(&mut self, args: &[&str]) {
         let ticks: u64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(20);
-        let logs = self.kernel.step(ticks);
-        let total = logs.len();
+        let mut first = Vec::new();
+        let mut tail = std::collections::VecDeque::<KernelEvent>::new();
+        let mut total = 0;
+        self.kernel.step_stream(ticks, |kernel, event| {
+            total += 1;
+            if first.len() < 5 {
+                first.push(event.display(kernel));
+            } else {
+                if tail.len() == 5 { tail.pop_front(); }
+                tail.push_back(event);
+            }
+        });
         if total <= 10 {
-            for line in logs {
+            for line in &first {
                 println!("  [SCHED] {}", line);
             }
         } else {
-            for line in &logs[..5] {
+            for line in &first {
                 println!("  [SCHED] {}", line);
             }
             println!("  ... [省略中间 {} 条调度日志] ...", total - 10);
-            for line in &logs[total - 5..] {
-                println!("  [SCHED] {}", line);
-            }
         }
+        for event in tail { println!("  [SCHED] {}", event.display(self.kernel)); }
         println!("完成 {} 个周期的调度推进。", ticks);
     }
 
@@ -387,9 +401,66 @@ impl<'a> KernelShell<'a> {
     }
 
     fn cmd_sync(&mut self) {
-        match self.kernel.vfs.sync() {
-            Ok(_) => println!("缓冲缓存已同步刷入磁盘介质 (Sync completed)."),
+        match self.kernel.commit_disk() {
+            Ok(_) => println!("文件系统元数据与缓存已成功提交持久化至磁盘 (Sync & Commit completed)."),
             Err(e) => println!("Sync 失败: {}", e),
+        }
+    }
+
+    fn cmd_save(&mut self, args: &[&str]) {
+        if args.is_empty() {
+            println!("用法: save <镜像保存路径> (例如: save disk.img)");
+            return;
+        }
+        let file_path = args[0];
+        if let Err(e) = self.kernel.commit_disk() {
+            println!("提交磁盘元数据失败: {}", e);
+            return;
+        }
+        match self.kernel.vfs.dev.save_to_file(file_path) {
+            Ok(_) => println!("磁盘镜像已成功导出至宿主机文件: {}", file_path),
+            Err(e) => println!("导出镜像失败: {}", e),
+        }
+    }
+
+    fn cmd_load(&mut self, args: &[&str]) {
+        if args.is_empty() {
+            println!("用法: load <镜像载入路径> (例如: load disk.img)");
+            return;
+        }
+        let file_path = args[0];
+        match crate::fs::VirtualBlockDevice::load_from_file(file_path) {
+            Ok(dev) => match self.kernel.load_filesystem(dev) {
+                Ok(()) => {
+                    self.current_working_dir = "/".to_string();
+                    println!("已成功载入镜像并重新挂载文件系统: {}", file_path);
+                }
+                Err(e) => println!("挂载载入的磁盘镜像失败: {}", e),
+            },
+            Err(e) => println!("读取镜像文件失败: {}", e),
+        }
+    }
+
+    fn cmd_exec(&mut self, args: &[&str]) {
+        if args.is_empty() {
+            println!("用法: exec <可执行文件路径> (例如: exec /bin/hello)");
+            return;
+        }
+        let norm_path = self.normalize_path(args[0]);
+        match self.kernel.spawn_executable(&norm_path, 0, 100) {
+            Ok(pid) => {
+                println!("已装载程序 '{}' 到新进程 PID {}，正在执行...", norm_path, pid);
+                let logs = self.kernel.step(10);
+                for l in logs {
+                    println!("  {}", l);
+                }
+                if !self.kernel.console_stdout.is_empty() {
+                    let out = String::from_utf8_lossy(&self.kernel.console_stdout);
+                    print!("[程序输出]:\n{}", out);
+                    self.kernel.console_stdout.clear();
+                }
+            }
+            Err(e) => println!("exec 执行失败: {}", e),
         }
     }
 }

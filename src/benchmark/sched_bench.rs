@@ -1,89 +1,112 @@
-//! 进程调度子系统性能基准测试 (CFS Scheduler Benchmarks)
+//! Scheduler-step throughput and separate simulated CPU context-load timing.
 
+use super::{collect_samples, median, median_f64};
+use crate::arch::{CpuContext, PrivilegeLevel, VirtualCpu};
 use crate::sched::{CfsScheduler, ProcessManager};
-use std::time::Instant;
+use std::hint::black_box;
+use std::time::{Duration, Instant};
 
 pub struct SchedBenchResult {
     pub jains_fairness_index: f64,
-    pub context_switches: u64,
+    pub task_selections: u64,
     pub total_schedule_time_us: u128,
-    pub avg_decision_latency_ns: f64,
-    pub avg_switch_latency_ns: f64,
+    pub avg_schedule_step_latency_ns: f64,
+    pub cpu_context_loads: u64,
+    pub avg_cpu_load_latency_ns: f64,
     pub sched_ops_per_sec: f64,
+}
+
+const TASK_COUNT: usize = 100;
+const SCHEDULE_STEPS: usize = 5_000;
+const CPU_LOADS: u64 = 100_000;
+
+struct ScheduleSample {
+    duration: Duration,
+    task_selections: u64,
+}
+
+fn schedule_sample() -> ScheduleSample {
+    let mut pm = ProcessManager::new(1000);
+    for index in 0..TASK_COUNT {
+        pm.spawn(&format!("task_{index:03}"), (index % 5) as i8 - 2, 10_000);
+    }
+    let start = Instant::now();
+    for _ in 0..SCHEDULE_STEPS {
+        black_box(pm.schedule_step(black_box(1)));
+    }
+    let duration = start.elapsed();
+    assert_eq!(pm.processes.values().map(|proc| proc.exec_time).sum::<u64>(), SCHEDULE_STEPS as u64 * 1000);
+    // The CFS counter increments on queue extraction, even if the same PID wins.
+    let task_selections = pm.scheduler.context_switches;
+    black_box(&pm);
+    ScheduleSample { duration, task_selections }
+}
+
+fn cpu_load_sample() -> Duration {
+    let contexts: Vec<_> = (0..16).map(|index| {
+        let mut context = CpuContext::new(0x1000 + index * 16, 0x8000 + index * 32);
+        context.rax = index;
+        context.rbx = index * 3;
+        context
+    }).collect();
+    let mut cpu = VirtualCpu::new();
+    let start = Instant::now();
+    for index in 0..CPU_LOADS {
+        let context = &contexts[index as usize % contexts.len()];
+        black_box(&mut cpu).switch_to(black_box(context), PrivilegeLevel::Ring3User);
+    }
+    let duration = start.elapsed();
+    assert_eq!(cpu.context_switches, CPU_LOADS);
+    assert_eq!(cpu.cycles, CPU_LOADS * 42);
+    assert_eq!(cpu.context.rip, contexts[(CPU_LOADS as usize - 1) % contexts.len()].rip);
+    black_box(cpu.context);
+    duration
 }
 
 pub fn run_sched_benchmark() -> SchedBenchResult {
     println!("\n========== [2/3] 进程调度子系统性能基准测试 ==========");
-
-    // 1. CFS 调度公平性验证 (Jain's Fairness Index)
-    let mut pm = ProcessManager::new(1000);
-    
-    // 创建不同优先级 (Nice) 的进程任务
-    // Nice -10 (高权重 9548)
-    // Nice   0 (基准权重 1024)
-    // Nice +10 (低权重 110)
-    let p_high = pm.spawn("high_prio_worker", -10, 2000);
-    let p_mid  = pm.spawn("normal_worker",     0, 2000);
-    let p_low  = pm.spawn("low_prio_worker",   10, 2000);
-
-    let test_ticks = 1_000;
-    for _ in 0..test_ticks {
-        let _ = pm.schedule_step(1);
+    let mut fairness_pm = ProcessManager::new(1000);
+    let high = fairness_pm.spawn("high_prio_worker", -10, 2000);
+    let mid = fairness_pm.spawn("normal_worker", 0, 2000);
+    let low = fairness_pm.spawn("low_prio_worker", 10, 2000);
+    for _ in 0..1000 {
+        black_box(fairness_pm.schedule_step(1));
     }
-
-    let p_high_proc = pm.processes.get(&p_high).unwrap();
-    let p_mid_proc  = pm.processes.get(&p_mid).unwrap();
-    let p_low_proc  = pm.processes.get(&p_low).unwrap();
-
-    let fairness_data = vec![
-        (p_high_proc.exec_time, p_high_proc.weight),
-        (p_mid_proc.exec_time, p_mid_proc.weight),
-        (p_low_proc.exec_time, p_low_proc.weight),
-    ];
-
-    let jains_index = CfsScheduler::compute_jains_fairness(&fairness_data);
-
-    println!("  [CFS 优先级权重与公平性验证 (Jain's Fairness)]");
-    println!("    - 高优先级 (-10, 权重 9548): 累计运行 {} ns", p_high_proc.exec_time);
-    println!("    - 中优先级 (  0, 权重 1024): 累计运行 {} ns", p_mid_proc.exec_time);
-    println!("    - 低优先级 (+10, 权重  110): 累计运行 {} ns", p_low_proc.exec_time);
-    println!("    - Jain 公平性指数: {:.4} (理论完全公平值为 1.0000, 实际表现达 {:.2}%)", 
-        jains_index, jains_index * 100.0);
-
-    // 2. 高并发多任务调度延迟与吞吐量测试 (100 个并发进程, 5000 次调度周期)
-    let mut pm_stress = ProcessManager::new(1000);
-    let task_count = 100;
-    for i in 0..task_count {
-        let nice = ((i % 5) as i8) - 2; // -2, -1, 0, 1, 2
-        pm_stress.spawn(&format!("task_{:03}", i), nice, 10_000);
+    let fairness_data: Vec<_> = [high, mid, low].iter().map(|pid| {
+        let proc = &fairness_pm.processes[pid];
+        (proc.exec_time, proc.weight)
+    }).collect();
+    let jains_fairness_index = CfsScheduler::compute_jains_fairness(&fairness_data);
+    println!("  [固定三任务公平性验证：1000 个 tick]");
+    for (pid, nice) in [(high, -10), (mid, 0), (low, 10)] {
+        let proc = &fairness_pm.processes[&pid];
+        println!("    - Nice {nice:>3}, 权重 {}, 累计运行 {} ns", proc.weight, proc.exec_time);
     }
+    println!("    - 权重归一化 Jain 指数: {jains_fairness_index:.4}（只代表本负载）。");
 
-    let sched_steps = 5_000;
-    let start_sched = Instant::now();
-    for _ in 0..sched_steps {
-        let _ = pm_stress.schedule_step(1);
-    }
-    let sched_duration = start_sched.elapsed();
+    let schedule = collect_samples(schedule_sample);
+    let duration = median(schedule.iter().map(|sample| sample.duration).collect());
+    let task_selections = median(schedule.iter().map(|sample| sample.task_selections).collect());
+    let avg_schedule_step_latency_ns = duration.as_nanos() as f64 / SCHEDULE_STEPS as f64;
+    let sched_ops_per_sec = median_f64(schedule.iter().map(|sample| SCHEDULE_STEPS as f64 / sample.duration.as_secs_f64()).collect());
+    let cpu_duration = median(collect_samples(cpu_load_sample));
+    let avg_cpu_load_latency_ns = cpu_duration.as_nanos() as f64 / CPU_LOADS as f64;
 
-    let switches = pm_stress.scheduler.context_switches;
-    let avg_decision_latency_ns = (sched_duration.as_nanos() as f64) / (sched_steps as f64);
-    let avg_switch_latency_ns = (sched_duration.as_nanos() as f64) / (switches.max(1) as f64);
-    let sched_ops_per_sec = (sched_steps as f64) / sched_duration.as_secs_f64();
-
-    println!("\n  [CFS 高并发调度延迟与平衡树吞吐量]");
-    println!("    - 并发任务数: {} 个活跃进程 (BTreeSet 纳秒级就绪树)", task_count);
-    println!("    - 调度循环次数: {} 次推进, 发生真实切换: {} 次", sched_steps, switches);
-    println!("    - 总测试耗时: {:.2?}", sched_duration);
-    println!("    - 单次调度判断延迟: {:.2} ns/step", avg_decision_latency_ns);
-    println!("    - 单次上下文切换平均耗时: {:.2} ns/switch", avg_switch_latency_ns);
-    println!("    - 调度决策吞吐量: {:.0} decisions/sec", sched_ops_per_sec);
+    println!("  [调度推进：每轮 {TASK_COUNT} 个任务，{SCHEDULE_STEPS} 次 step]");
+    println!("    - 每轮队列任务选择: {task_selections} 次；这项计数来自 CFS 队列提取。");
+    println!("    - 总耗时中位数: {duration:.2?}");
+    println!("    - 每次调度推进中位数: {avg_schedule_step_latency_ns:.2} ns/step（含进程记账与队列维护）");
+    println!("    - 推进吞吐中位数: {sched_ops_per_sec:.0} steps/sec");
+    println!("  [独立模拟 CPU 上下文加载：每轮 {CPU_LOADS} 次 VirtualCpu::switch_to]");
+    println!("    - 每次加载中位数: {avg_cpu_load_latency_ns:.2} ns/load（复制模拟寄存器、更新模式与计数）");
 
     SchedBenchResult {
-        jains_fairness_index: jains_index,
-        context_switches: switches,
-        total_schedule_time_us: sched_duration.as_micros(),
-        avg_decision_latency_ns,
-        avg_switch_latency_ns,
+        jains_fairness_index,
+        task_selections,
+        total_schedule_time_us: duration.as_micros(),
+        avg_schedule_step_latency_ns,
+        cpu_context_loads: CPU_LOADS,
+        avg_cpu_load_latency_ns,
         sched_ops_per_sec,
     }
 }
